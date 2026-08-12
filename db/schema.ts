@@ -17,6 +17,8 @@ export const evidence = sqliteTable("evidence", {
   id: text("id").primaryKey(), sessionId: text("session_id").notNull(), eventIndex: integer("event_index").notNull(),
   title: text("title").notNull(), factText: text("fact_text").notNull(), impact: text("impact").notNull(),
   strength: text("strength").notNull(), sourceTitle: text("source_title").notNull(), sourceLocator: text("source_locator").notNull(),
+  sourcePublisher: text("source_publisher").notNull(), sourceUrl: text("source_url"), sourceExcerpt: text("source_excerpt").notNull(),
+  contentHash: text("content_hash").notNull(), extractorVersion: text("extractor_version").notNull(), verification: text("verification").notNull(),
   publishedAt: text("published_at").notNull(), canonicalEventId: text("canonical_event_id").notNull(),
 }, (table) => [index("idx_evidence_session_event").on(table.sessionId, table.eventIndex)]);
 
@@ -85,6 +87,7 @@ export const importedEvidence = sqliteTable("imported_evidence", {
   canonicalEventId: text("canonical_event_id").notNull(), title: text("title").notNull(), factText: text("fact_text").notNull(),
   sourceExcerpt: text("source_excerpt").notNull(), sourceLocator: text("source_locator").notNull(), assumptionCode: text("assumption_code").notNull(),
   impact: text("impact").notNull(), strength: text("strength").notNull(), verification: text("verification").notNull().default("UNVERIFIED"),
+  extractorVersion: text("extractor_version").notNull().default("local-parser-v1"),
   createdAt: text("created_at").notNull(),
 }, (table) => [
   index("idx_imported_evidence_owner_created").on(table.ownerId, table.createdAt),
@@ -104,5 +107,6 @@ export const reviewEvents = sqliteTable("review_events", {
 export const workflowRuns = sqliteTable("workflow_runs", {
   id: text("id").primaryKey(), ownerId: text("owner_id").notNull(), module: text("module").notNull(), status: text("status").notNull(),
   provider: text("provider").notNull(), inputHash: text("input_hash").notNull(), outputSummary: text("output_summary"), errorCode: text("error_code"),
-  latencyMs: integer("latency_ms").notNull().default(0), createdAt: text("created_at").notNull(),
+  latencyMs: integer("latency_ms").notNull().default(0), inputTokens: integer("input_tokens").notNull().default(0),
+  outputTokens: integer("output_tokens").notNull().default(0), estimatedCostCny: real("estimated_cost_cny"), createdAt: text("created_at").notNull(),
 }, (table) => [index("idx_workflow_runs_owner_created").on(table.ownerId, table.createdAt)]);
