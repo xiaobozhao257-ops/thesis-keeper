@@ -8,7 +8,13 @@ export interface StructuredLLMProvider {
     schemaVersion: string;
     input: TInput;
     idempotencyKey: string;
-  }): Promise<{ output: TOutput; provider: string; model: string; latencyMs: number }>;
+  }): Promise<{
+    output: TOutput;
+    provider: string;
+    model: string;
+    latencyMs: number;
+    usage?: { inputTokens: number; outputTokens: number; estimatedCostCny?: number };
+  }>;
 }
 
 export class LLMNotConfiguredError extends Error {

@@ -6,10 +6,7 @@ import {
   type ProviderMetricObservation,
 } from "./MarketDataProvider.ts";
 
-export type RicequantConfig = {
-  apiKey?: string;
-  baseUrl?: string;
-};
+export type RicequantConfig = { bridgeUrl?: string };
 
 export class RicequantMarketDataProvider implements MarketDataProvider {
   readonly providerName = "ricequant";
@@ -17,36 +14,48 @@ export class RicequantMarketDataProvider implements MarketDataProvider {
 
   constructor(config: RicequantConfig) { this.config = config; }
 
-  private assertConfigured() {
-    if (!this.config.apiKey || !this.config.baseUrl) throw new ProviderNotConfiguredError(this.providerName);
+  private get baseUrl() {
+    if (!this.config.bridgeUrl) throw new ProviderNotConfiguredError(this.providerName);
+    return this.config.bridgeUrl.replace(/\/+$/, "");
   }
 
-  async searchInstruments(_query: string): Promise<ProviderInstrument[]> {
-    void _query;
-    this.assertConfigured();
-    throw new Error("RICEQUANT_ADAPTER_NOT_IMPLEMENTED");
+  private async request<T>(path: string): Promise<T> {
+    const response = await fetch(`${this.baseUrl}${path}`, { headers: { accept: "application/json" } });
+    if (!response.ok) throw new Error(`RICEQUANT_BRIDGE_HTTP_${response.status}`);
+    return response.json() as Promise<T>;
   }
 
-  async getInstrument(_providerSymbol: string): Promise<ProviderInstrument | null> {
-    void _providerSymbol;
-    this.assertConfigured();
-    throw new Error("RICEQUANT_ADAPTER_NOT_IMPLEMENTED");
+  async searchInstruments(query: string): Promise<ProviderInstrument[]> {
+    return this.request(`/instruments/search?q=${encodeURIComponent(query)}`);
   }
 
-  async getMetricSeries(_input: {
+  async getInstrument(providerSymbol: string): Promise<ProviderInstrument | null> {
+    return this.request(`/instruments/${encodeURIComponent(providerSymbol)}`);
+  }
+
+  async getMetricSeries(input: {
     providerSymbol: string;
     metricKey: string;
     period: "DAY" | "MONTH" | "QUARTER" | "YEAR";
     from: string;
     to: string;
   }): Promise<ProviderMetricObservation[]> {
-    void _input;
-    this.assertConfigured();
-    throw new Error("RICEQUANT_ADAPTER_NOT_IMPLEMENTED");
+    const params = new URLSearchParams({
+      symbol: input.providerSymbol,
+      metricKey: input.metricKey,
+      period: input.period,
+      from: input.from,
+      to: input.to,
+    });
+    return this.request(`/metrics?${params.toString()}`);
   }
 
   async getCapabilities() {
-    this.assertConfigured();
-    return { assetTypes: ["EQUITY", "ETF", "LOF"] as AssetType[], metricKeys: [], supportsPointInTime: false };
+    void this.baseUrl;
+    return {
+      assetTypes: ["EQUITY", "ETF", "LOF"] as AssetType[],
+      metricKeys: ["price_close", "turnover", "nav"],
+      supportsPointInTime: true,
+    };
   }
 }

@@ -1,4 +1,5 @@
 import type { AssetType } from "../providers/market/MarketDataProvider";
+import { z } from "zod";
 
 export type ThesisDraftPayload = {
   instrumentName: string;
@@ -25,6 +26,104 @@ export type ThesisDraftPayload = {
   clarificationQuestions: string[];
   fuzzyExpressions: string[];
 };
+
+const assumptionSchema = z.object({
+  code: z.string().trim().min(1).max(20),
+  title: z.string().trim().min(1).max(120),
+  description: z.string().trim().min(1).max(1000),
+  weight: z.number().min(0).max(1),
+});
+
+const metricSchema = z.object({
+  key: z.string().trim().min(1).max(80),
+  name: z.string().trim().min(1).max(120),
+  unit: z.string().trim().min(1).max(40),
+  period: z.string().trim().min(1).max(40),
+  assumptionCode: z.string().trim().min(1).max(20),
+});
+
+const ruleSchema = z.object({
+  type: z.enum(["METRIC_RULE", "EVIDENCE_RULE"]),
+  name: z.string().trim().min(1).max(240),
+  metricKey: z.string().trim().min(1).max(80).optional(),
+  operator: z.enum(["LT", "LTE", "GT", "GTE"]).optional(),
+  threshold: z.number().finite().optional(),
+  unit: z.string().trim().min(1).max(40).optional(),
+  requiredConsecutivePeriods: z.number().int().min(1).max(12).optional(),
+  action: z.enum(["MUST_REVIEW", "ATTENTION_ONLY"]),
+});
+
+export const thesisDraftSchema = z.object({
+  instrumentName: z.string().trim().min(1).max(80),
+  canonicalCode: z.string().trim().min(2).max(24),
+  assetType: z.enum(["EQUITY", "ETF", "LOF"]),
+  inputText: z.string().trim().min(12).max(6000),
+  coreThesis: z.string().trim().min(8).max(1200),
+  horizonMinMonths: z.number().int().min(1).max(120),
+  horizonMaxMonths: z.number().int().min(1).max(240),
+  confidence: z.number().int().min(0).max(100),
+  assumptions: z.array(assumptionSchema).min(1).max(10),
+  metrics: z.array(metricSchema).max(20),
+  risks: z.array(z.object({
+    title: z.string().trim().min(1).max(160),
+    description: z.string().trim().min(1).max(1000),
+    assumptionCode: z.string().trim().min(1).max(20).optional(),
+  })).max(20),
+  rules: z.array(ruleSchema).max(20),
+  clarificationQuestions: z.array(z.string().trim().min(1).max(500)).max(10),
+  fuzzyExpressions: z.array(z.string().trim().min(1).max(40)).max(20),
+}).superRefine((draft, context) => {
+  if (draft.canonicalCode !== "CN.DEMO.HXZS" && !/^\d{6}\.(XSHG|XSHE)$/.test(draft.canonicalCode)) {
+    context.addIssue({ code: "custom", path: ["canonicalCode"], message: "P0 仅支持 XSHG/XSHE 境内交易所六位代码" });
+  }
+  if (draft.horizonMinMonths > draft.horizonMaxMonths) {
+    context.addIssue({ code: "custom", path: ["horizonMaxMonths"], message: "最长投资周期不能短于最短周期" });
+  }
+  const assumptionCodes = new Set(draft.assumptions.map((item) => item.code));
+  if (assumptionCodes.size !== draft.assumptions.length) {
+    context.addIssue({ code: "custom", path: ["assumptions"], message: "假设代码不能重复" });
+  }
+  const totalWeight = draft.assumptions.reduce((sum, item) => sum + item.weight, 0);
+  if (Math.abs(totalWeight - 1) > 0.0001) {
+    context.addIssue({ code: "custom", path: ["assumptions"], message: "假设权重之和必须等于 1" });
+  }
+  draft.metrics.forEach((metric, index) => {
+    if (!assumptionCodes.has(metric.assumptionCode)) {
+      context.addIssue({ code: "custom", path: ["metrics", index, "assumptionCode"], message: "指标必须关联有效假设" });
+    }
+    const catalogMetric = metricCatalog[draft.assetType].find((item) => item.key === metric.key);
+    if (!catalogMetric || catalogMetric.unit !== metric.unit || catalogMetric.period !== metric.period) {
+      context.addIssue({ code: "custom", path: ["metrics", index], message: `指标 ${metric.key} 不适用于当前资产类型` });
+    }
+  });
+  draft.rules.forEach((rule, index) => {
+    if (rule.type === "EVIDENCE_RULE" && rule.action !== "ATTENTION_ONLY") {
+      context.addIssue({ code: "custom", path: ["rules", index, "action"], message: "证据规则只能触发关注" });
+    }
+    if (rule.type === "METRIC_RULE") {
+      const metric = draft.metrics.find((item) => item.key === rule.metricKey);
+      if (!metric || !rule.operator || rule.threshold === undefined || !rule.requiredConsecutivePeriods || rule.unit !== metric.unit) {
+        context.addIssue({ code: "custom", path: ["rules", index], message: "数值规则缺少有效指标、单位、阈值或连续周期" });
+      }
+    }
+  });
+});
+
+export function validateThesisDraft(input: unknown): ThesisDraftPayload {
+  const result = thesisDraftSchema.safeParse(input);
+  if (!result.success) {
+    const message = result.error.issues.map((issue) => `${issue.path.join(".") || "draft"}: ${issue.message}`).join("；");
+    throw new Error(`THESIS_SCHEMA_INVALID:${message}`);
+  }
+  return result.data;
+}
+
+export function canonicalJson(value: unknown): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  const record = value as Record<string, unknown>;
+  return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(record[key])}`).join(",")}}`;
+}
 
 export const metricCatalog = {
   EQUITY: [

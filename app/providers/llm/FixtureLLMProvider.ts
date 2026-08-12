@@ -19,6 +19,7 @@ export class FixtureLLMProvider implements StructuredLLMProvider {
       provider: this.providerName,
       model: "fixture-v1",
       latencyMs: Date.now() - startedAt,
+      usage: { inputTokens: 0, outputTokens: 0 },
     };
   }
 }

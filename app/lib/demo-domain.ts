@@ -10,6 +10,7 @@ export type EvidenceItem = {
   impact: EvidenceImpact;
   strength: "WEAK" | "MEDIUM" | "STRONG";
   sourceTitle: string;
+  sourcePublisher: string;
   sourceLocator: string;
   publishedAt: string;
   assumptionCode: "A1" | "A2" | "A3";
@@ -37,6 +38,34 @@ export const metricSeries = [
   { label: "T5", value: 17 },
 ];
 
+export type MetricObservation = { value: number; unit: string; periodEnd: string };
+export type MetricRule = {
+  operator: "LT" | "LTE" | "GT" | "GTE";
+  threshold: number;
+  unit: string;
+  requiredConsecutivePeriods: number;
+};
+
+export function evaluateMetricRule(rule: MetricRule, observations: MetricObservation[]) {
+  if (!observations.length) {
+    return { status: "DATA_MISSING" as const, current: 0, required: rule.requiredConsecutivePeriods, label: "数据缺失" };
+  }
+  const ordered = [...observations].sort((left, right) => left.periodEnd.localeCompare(right.periodEnd));
+  if (ordered.some((item) => item.unit !== rule.unit)) throw new Error("RULE_UNIT_MISMATCH");
+  const matches = (value: number) => rule.operator === "LT" ? value < rule.threshold
+    : rule.operator === "LTE" ? value <= rule.threshold
+      : rule.operator === "GT" ? value > rule.threshold
+        : value >= rule.threshold;
+  let current = 0;
+  for (let index = ordered.length - 1; index >= 0 && matches(ordered[index].value); index -= 1) current += 1;
+  const capped = Math.min(current, rule.requiredConsecutivePeriods);
+  const status = capped >= rule.requiredConsecutivePeriods ? "TRIGGERED" as const : capped > 0 ? "APPROACHING" as const : "NO_MATCH" as const;
+  const label = status === "TRIGGERED" ? `已触发 ${capped}/${rule.requiredConsecutivePeriods}`
+    : status === "APPROACHING" ? `接近阈值 ${capped}/${rule.requiredConsecutivePeriods}`
+      : `未触发 0/${rule.requiredConsecutivePeriods}`;
+  return { status, current: capped, required: rule.requiredConsecutivePeriods, label };
+}
+
 export const seededEvidence: EvidenceItem[] = [
   {
     id: "ev-t2-demand",
@@ -46,6 +75,7 @@ export const seededEvidence: EvidenceItem[] = [
     impact: "SUPPORT",
     strength: "MEDIUM",
     sourceTitle: "T2 行业跟踪数据（演示）",
+    sourcePublisher: "Thesis Keeper 固定演示数据集",
     sourceLocator: "fixture://cn-equity-demo-v1/T2#industry-orders",
     publishedAt: "2026-04-18T00:00:00Z",
     assumptionCode: "A1",
@@ -58,6 +88,7 @@ export const seededEvidence: EvidenceItem[] = [
     impact: "WEAKEN",
     strength: "STRONG",
     sourceTitle: "T3 客户供应链跟踪（演示）",
+    sourcePublisher: "Thesis Keeper 固定演示数据集",
     sourceLocator: "fixture://cn-equity-demo-v1/T3#customer-substitution",
     publishedAt: "2026-05-22T00:00:00Z",
     assumptionCode: "A2",
@@ -70,6 +101,7 @@ export const seededEvidence: EvidenceItem[] = [
     impact: "WEAKEN",
     strength: "MEDIUM",
     sourceTitle: "T4 季度经营数据（演示）",
+    sourcePublisher: "Thesis Keeper 固定演示数据集",
     sourceLocator: "fixture://cn-equity-demo-v1/T4#revenue-growth",
     publishedAt: "2026-06-30T00:00:00Z",
     assumptionCode: "A1",
@@ -82,6 +114,7 @@ export const seededEvidence: EvidenceItem[] = [
     impact: "CONTRADICT",
     strength: "STRONG",
     sourceTitle: "T5 季度经营数据（演示）",
+    sourcePublisher: "Thesis Keeper 固定演示数据集",
     sourceLocator: "fixture://cn-equity-demo-v1/T5#revenue-growth",
     publishedAt: "2026-08-11T00:00:00Z",
     assumptionCode: "A1",
@@ -112,6 +145,16 @@ export function getRuleState(currentPoint: number) {
   if (currentPoint >= 5) return { status: "TRIGGERED", current: 2, required: 2, label: "已触发 2/2" };
   if (currentPoint >= 4) return { status: "APPROACHING", current: 1, required: 2, label: "接近阈值 1/2" };
   return { status: "NO_MATCH", current: 0, required: 2, label: "未触发 0/2" };
+}
+
+export function isScenarioDataAvailable(scenarioId: string) {
+  return scenarioId === "cn-equity-demo-v1";
+}
+
+export function getScenarioRuleState(scenarioId: string, currentPoint: number) {
+  return isScenarioDataAvailable(scenarioId)
+    ? getRuleState(currentPoint)
+    : { status: "DATA_MISSING", current: 0, required: 2, label: "数据缺失" };
 }
 
 export function stateLabel(status: HealthStatus) {

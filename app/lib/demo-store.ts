@@ -1,8 +1,10 @@
 import { env as workerEnv } from "cloudflare:workers";
-import { calculateHealth, getRuleState, seededEvidence } from "./demo-domain";
-import { compileThesisDraft, parseEvidenceInput, type ThesisDraftPayload } from "./product-domain";
+import { calculateHealth, getRuleState, getScenarioRuleState, isScenarioDataAvailable, seededEvidence } from "./demo-domain";
+import { canonicalJson, compileThesisDraft, parseEvidenceInput, validateThesisDraft, type ThesisDraftPayload } from "./product-domain";
 import { FixtureLLMProvider } from "../providers/llm/FixtureLLMProvider";
 import { RemoteStructuredLLMProvider } from "../providers/llm/RemoteStructuredLLMProvider";
+import { MockMarketDataProvider } from "../providers/market/MockMarketDataProvider";
+import { immutableDatabaseTriggers } from "./database-invariants";
 
 type AppEnv = {
   DB: D1Database;
@@ -11,8 +13,7 @@ type AppEnv = {
   LLM_BASE_URL?: string;
   LLM_MODEL?: string;
   MARKET_DATA_PROVIDER?: string;
-  RICEQUANT_API_KEY?: string;
-  RICEQUANT_BASE_URL?: string;
+  RICEQUANT_BRIDGE_URL?: string;
 };
 
 const env = workerEnv as unknown as AppEnv;
@@ -52,7 +53,13 @@ const schemaStatements = [
     impact TEXT NOT NULL,
     strength TEXT NOT NULL,
     source_title TEXT NOT NULL,
+    source_publisher TEXT NOT NULL DEFAULT '',
+    source_url TEXT,
+    source_excerpt TEXT NOT NULL DEFAULT '',
     source_locator TEXT NOT NULL,
+    content_hash TEXT NOT NULL DEFAULT '',
+    extractor_version TEXT NOT NULL DEFAULT 'fixture-evidence-v1',
+    verification TEXT NOT NULL DEFAULT 'VERIFIED',
     published_at TEXT NOT NULL,
     canonical_event_id TEXT NOT NULL
   )`,
@@ -163,6 +170,7 @@ const schemaStatements = [
     impact TEXT NOT NULL,
     strength TEXT NOT NULL,
     verification TEXT NOT NULL DEFAULT 'UNVERIFIED',
+    extractor_version TEXT NOT NULL DEFAULT 'local-parser-v1',
     created_at TEXT NOT NULL
   )`,
   `CREATE TABLE IF NOT EXISTS evidence_feedback (
@@ -193,6 +201,9 @@ const schemaStatements = [
     output_summary TEXT,
     error_code TEXT,
     latency_ms INTEGER NOT NULL DEFAULT 0,
+    input_tokens INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    estimated_cost_cny REAL,
     created_at TEXT NOT NULL
   )`,
   `CREATE INDEX IF NOT EXISTS idx_demo_sessions_owner ON demo_sessions(owner_id)`,
@@ -204,8 +215,7 @@ const schemaStatements = [
   `CREATE UNIQUE INDEX IF NOT EXISTS idx_imported_evidence_owner_event ON imported_evidence(owner_id, canonical_event_id)`,
   `CREATE INDEX IF NOT EXISTS idx_review_events_owner_session ON review_events(owner_id, session_id)`,
   `CREATE INDEX IF NOT EXISTS idx_workflow_runs_owner_created ON workflow_runs(owner_id, created_at)`,
-  `CREATE TRIGGER IF NOT EXISTS prevent_decision_snapshot_update
-    BEFORE UPDATE ON decision_snapshots BEGIN SELECT RAISE(ABORT, 'IMMUTABLE_SNAPSHOT'); END`,
+  ...immutableDatabaseTriggers,
 ];
 
 function getD1() {
@@ -253,11 +263,16 @@ export async function initializeDemoStore(ownerId = DEFAULT_OWNER) {
   const versionId = fixtureVersionIdFor(owner);
   const db = getD1();
   await db.batch(schemaStatements.map((statement) => db.prepare(statement)));
+  await ensureProvenanceColumns(db);
 
   const now = new Date().toISOString();
   const payload = fixturePayload();
-  const payloadJson = JSON.stringify(payload);
+  const payloadJson = canonicalJson(payload);
   const payloadHash = await sha256(payloadJson);
+  const fixtureEvidenceWithHashes = await Promise.all(seededEvidence.map(async (item) => ({
+    ...item,
+    contentHash: await sha256(canonicalJson({ title: item.sourceTitle, factText: item.factText, locator: item.sourceLocator })),
+  })));
   await db.batch([
     db.prepare(`INSERT OR IGNORE INTO demo_sessions
       (id, owner_id, scenario_id, current_point, thesis_confirmed, review_status, updated_at)
@@ -278,15 +293,46 @@ export async function initializeDemoStore(ownerId = DEFAULT_OWNER) {
       VALUES (?, ?, ?, 1, 'ACTIVE', ?, ?, ?, ?, ?, 'INITIAL', ?, ?, ?, ?)`)
       .bind(versionId, thesisId, owner, payload.inputText, payload.coreThesis, payload.horizonMinMonths,
         payload.horizonMaxMonths, payload.confidence, payloadJson, payloadHash, now, "2026-02-12T00:00:00Z"),
-    ...seededEvidence.map((item) => db.prepare(`INSERT OR IGNORE INTO evidence
-      (id, session_id, event_index, title, fact_text, impact, strength, source_title, source_locator, published_at, canonical_event_id)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+    ...fixtureEvidenceWithHashes.map((item) => db.prepare(`INSERT INTO evidence
+      (id, session_id, event_index, title, fact_text, impact, strength, source_title, source_publisher, source_url,
+       source_excerpt, source_locator, content_hash, extractor_version, verification, published_at, canonical_event_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, 'fixture-evidence-v1', 'VERIFIED', ?, ?)
+      ON CONFLICT(id) DO UPDATE SET source_publisher = excluded.source_publisher, source_excerpt = excluded.source_excerpt,
+        content_hash = excluded.content_hash, extractor_version = excluded.extractor_version, verification = excluded.verification`)
       .bind(`${sessionId}:${item.id}`, sessionId, item.eventIndex, item.title, item.factText, item.impact,
-        item.strength, item.sourceTitle, item.sourceLocator, item.publishedAt, item.id)),
+        item.strength, item.sourceTitle, item.sourcePublisher, item.factText, item.sourceLocator, item.contentHash, item.publishedAt, item.id)),
   ]);
 
   const assumptionCount = await db.prepare("SELECT COUNT(*) AS count FROM product_assumptions WHERE version_id = ?").bind(versionId).first<{ count: number }>();
   if (!assumptionCount?.count) await persistVersionChildren(db, versionId, payload);
+}
+
+async function ensureProvenanceColumns(db: D1Database) {
+  const evidenceColumns = await db.prepare("PRAGMA table_info(evidence)").all<{ name: string }>();
+  const importedColumns = await db.prepare("PRAGMA table_info(imported_evidence)").all<{ name: string }>();
+  const workflowColumns = await db.prepare("PRAGMA table_info(workflow_runs)").all<{ name: string }>();
+  const existingEvidence = new Set(evidenceColumns.results.map((row) => row.name));
+  const existingImported = new Set(importedColumns.results.map((row) => row.name));
+  const existingWorkflow = new Set(workflowColumns.results.map((row) => row.name));
+  const additions = [
+    ...[
+      ["source_publisher", "TEXT NOT NULL DEFAULT ''"],
+      ["source_url", "TEXT"],
+      ["source_excerpt", "TEXT NOT NULL DEFAULT ''"],
+      ["content_hash", "TEXT NOT NULL DEFAULT ''"],
+      ["extractor_version", "TEXT NOT NULL DEFAULT 'fixture-evidence-v1'"],
+      ["verification", "TEXT NOT NULL DEFAULT 'VERIFIED'"],
+    ].filter(([name]) => !existingEvidence.has(name)).map(([name, definition]) => db.prepare(`ALTER TABLE evidence ADD COLUMN ${name} ${definition}`)),
+    ...(!existingImported.has("extractor_version")
+      ? [db.prepare("ALTER TABLE imported_evidence ADD COLUMN extractor_version TEXT NOT NULL DEFAULT 'local-parser-v1'")]
+      : []),
+    ...[
+      ["input_tokens", "INTEGER NOT NULL DEFAULT 0"],
+      ["output_tokens", "INTEGER NOT NULL DEFAULT 0"],
+      ["estimated_cost_cny", "REAL"],
+    ].filter(([name]) => !existingWorkflow.has(name)).map(([name, definition]) => db.prepare(`ALTER TABLE workflow_runs ADD COLUMN ${name} ${definition}`)),
+  ];
+  if (additions.length) await db.batch(additions);
 }
 
 async function persistVersionChildren(db: D1Database, versionId: string, payload: ThesisDraftPayload) {
@@ -319,10 +365,14 @@ export async function readDemoState(ownerId = DEFAULT_OWNER) {
   if (!session) throw new Error("Demo session not found");
 
   const currentPoint = Number(session.current_point ?? 0);
+  const isEmptyFundScenario = !isScenarioDataAvailable(String(session.scenario_id));
   const [fixtureEvidence, importedEvidence, snapshotResult, activeVersion, draftVersion, versionHistory, feedbackRows, reviewRows, workflowRows] = await Promise.all([
     db.prepare("SELECT * FROM evidence WHERE session_id = ? AND event_index <= ? ORDER BY event_index DESC")
       .bind(sessionId, currentPoint).all<DbRow>(),
-    db.prepare("SELECT * FROM imported_evidence WHERE owner_id = ? ORDER BY created_at DESC").bind(owner).all<DbRow>(),
+    db.prepare(`SELECT e.*, d.title AS source_title, d.publisher, d.published_at AS document_published_at,
+      d.source_url, d.content_hash AS document_content_hash
+      FROM imported_evidence e JOIN source_documents d ON d.id = e.source_document_id
+      WHERE e.owner_id = ? ORDER BY e.created_at DESC`).bind(owner).all<DbRow>(),
     db.prepare("SELECT * FROM decision_snapshots WHERE session_id = ? ORDER BY created_at DESC").bind(sessionId).all<DbRow>(),
     db.prepare("SELECT * FROM product_thesis_versions WHERE owner_id = ? AND status = 'ACTIVE' ORDER BY version_no DESC LIMIT 1").bind(owner).first<DbRow>(),
     db.prepare("SELECT * FROM product_thesis_versions WHERE owner_id = ? AND status = 'DRAFT' ORDER BY created_at DESC LIMIT 1").bind(owner).first<DbRow>(),
@@ -334,12 +384,22 @@ export async function readDemoState(ownerId = DEFAULT_OWNER) {
 
   const feedback = new Map(feedbackRows.results.map((row) => [String(row.evidence_id), row]));
   const disputed = reviewRows.results.some((row) => row.event_type === "TRIGGER_DISPUTED");
-  const baseHealth = calculateHealth(currentPoint);
+  const fixtureCounterEvidenceId = `${sessionId}:ev-t3-substitution`;
+  const counterEvidenceRejected = String(feedback.get(fixtureCounterEvidenceId)?.feedback ?? "") === "REJECTED";
+  const calculatedHealth = calculateHealth(isEmptyFundScenario ? 0 : currentPoint);
+  const baseHealth = counterEvidenceRejected && currentPoint >= 3
+    ? {
+        ...calculatedHealth,
+        score: Math.min(100, calculatedHealth.score + calculatedHealth.breakdown.evidencePenalty),
+        status: currentPoint >= 5 ? calculatedHealth.status : "HEALTHY" as const,
+        breakdown: { ...calculatedHealth.breakdown, evidencePenalty: 0 },
+      }
+    : calculatedHealth;
   const health = disputed && baseHealth.status === "MUST_REVIEW"
     ? { ...baseHealth, score: Math.max(baseHealth.score, 48), status: "ATTENTION" as const, breakdown: { ...baseHealth.breakdown, triggerPenalty: 15 } }
     : baseHealth;
-  const baseRule = getRuleState(currentPoint);
-  const rule = disputed ? { ...baseRule, status: "DISPUTED", label: "已提出异议" } : baseRule;
+  const baseRule = getScenarioRuleState(String(session.scenario_id), currentPoint);
+  const rule = !isEmptyFundScenario && disputed ? { ...baseRule, status: "DISPUTED", label: "已提出异议" } : baseRule;
 
   const mapEvidence = (row: DbRow, imported: boolean) => {
     const id = String(row.id);
@@ -351,15 +411,55 @@ export async function readDemoState(ownerId = DEFAULT_OWNER) {
       factText: String(row.fact_text),
       impact: String(row.impact),
       strength: String(row.strength),
-      sourceTitle: imported ? "用户导入资料" : String(row.source_title),
+      sourceTitle: String(row.source_title),
+      sourcePublisher: imported ? String(row.publisher) : String(row.source_publisher),
+      sourceUrl: row.source_url ? String(row.source_url) : null,
+      sourceExcerpt: imported ? String(row.source_excerpt) : String(row.source_excerpt || row.fact_text),
       sourceLocator: imported ? String(row.source_locator) : String(row.source_locator),
-      publishedAt: imported ? String(row.created_at) : String(row.published_at),
-      assumptionCode: imported ? String(row.assumption_code) : String(row.event_index) === "3" ? "A2" : "A1",
-      verification: imported ? String(row.verification) : "VERIFIED",
+      contentHash: imported ? String(row.document_content_hash) : String(row.content_hash),
+      extractorVersion: String(row.extractor_version),
+      publishedAt: imported ? String(row.document_published_at) : String(row.published_at),
+      assumptionCode: itemFeedback?.assumption_code
+        ? String(itemFeedback.assumption_code)
+        : imported ? String(row.assumption_code) : String(row.event_index) === "3" ? "A2" : "A1",
+      verification: String(row.verification),
       imported,
       feedback: itemFeedback ? String(itemFeedback.feedback) : "NONE",
     };
   };
+
+  const snapshots = await Promise.all(snapshotResult.results.map(async (row) => {
+    const frozenPayload = String(row.frozen_payload ?? "");
+    const frozen = safeJson(frozenPayload) as {
+      thesis?: { versionNo?: number };
+      thesisVersionId?: string;
+      evidence?: Array<{ id?: string; title?: string; impact?: string; sourceTitle?: string; publishedAt?: string; verification?: string }>;
+      priceSnapshot?: { value: number; currency: string; observedAt: string; source: string };
+      challengerEvidence?: string;
+    } | null;
+    return {
+      id: String(row.id), action: String(row.action), reason: String(row.reason),
+      confidence: Number(row.confidence), healthScore: Number(row.health_score),
+      createdAt: String(row.created_at), contentHash: String(row.content_hash),
+      integrityValid: Boolean(frozenPayload) && await sha256(frozenPayload) === String(row.content_hash),
+      thesisVersionId: String(row.thesis_version_id),
+      thesisVersionNo: Number(frozen?.thesis?.versionNo ?? 1),
+      evidenceCount: frozen?.evidence?.length ?? 0,
+      counterEvidenceCount: frozen?.evidence?.filter((item) => item.impact === "WEAKEN" || item.impact === "CONTRADICT").length ?? 0,
+      evidence: frozen?.evidence?.map((item) => ({
+        id: String(item.id ?? ""), title: String(item.title ?? ""), impact: String(item.impact ?? "NEUTRAL"),
+        sourceTitle: String(item.sourceTitle ?? ""), publishedAt: String(item.publishedAt ?? ""), verification: String(item.verification ?? "UNVERIFIED"),
+      })) ?? [],
+      priceSnapshot: frozen?.priceSnapshot ?? null,
+      challengerEvidence: frozen?.challengerEvidence ?? null,
+    };
+  }));
+
+  const reviewOpened = reviewRows.results.find((row) => row.event_type === "REVIEW_OPENED");
+  const reviewOpenedPayload = reviewOpened ? safeJson(reviewOpened.payload) as { thesisVersionId?: string } | null : null;
+  const reviewVersionRow = reviewOpenedPayload?.thesisVersionId
+    ? versionHistory.results.find((row) => String(row.id) === reviewOpenedPayload.thesisVersionId)
+    : undefined;
 
   return {
     session: {
@@ -373,16 +473,13 @@ export async function readDemoState(ownerId = DEFAULT_OWNER) {
     },
     health,
     rule,
-    evidence: [
+    evidence: isEmptyFundScenario ? [] : [
       ...importedEvidence.results.map((row) => mapEvidence(row, true)),
       ...fixtureEvidence.results.map((row) => mapEvidence(row, false)),
     ],
-    snapshots: snapshotResult.results.map((row) => ({
-      id: String(row.id), action: String(row.action), reason: String(row.reason),
-      confidence: Number(row.confidence), healthScore: Number(row.health_score),
-      createdAt: String(row.created_at), contentHash: String(row.content_hash),
-    })),
+    snapshots,
     thesis: activeVersion ? mapVersion(activeVersion) : null,
+    reviewThesis: reviewVersionRow ? mapVersion(reviewVersionRow) : activeVersion ? mapVersion(activeVersion) : null,
     draft: draftVersion ? mapVersion(draftVersion) : null,
     versions: versionHistory.results.map(mapVersion),
     reviewEvents: reviewRows.results.map((row) => ({ id: String(row.id), type: String(row.event_type), payload: safeJson(row.payload), createdAt: String(row.created_at) })),
@@ -390,10 +487,12 @@ export async function readDemoState(ownerId = DEFAULT_OWNER) {
       id: String(row.id), module: String(row.module), status: String(row.status), provider: String(row.provider),
       outputSummary: String(row.output_summary ?? ""), errorCode: row.error_code ? String(row.error_code) : null,
       latencyMs: Number(row.latency_ms), createdAt: String(row.created_at),
+      inputTokens: Number(row.input_tokens ?? 0), outputTokens: Number(row.output_tokens ?? 0),
+      estimatedCostCny: row.estimated_cost_cny === null || row.estimated_cost_cny === undefined ? null : Number(row.estimated_cost_cny),
     })),
     providers: {
       llm: { selected: env.LLM_PROVIDER || "fixture", configured: Boolean(env.LLM_API_KEY && env.LLM_BASE_URL && env.LLM_MODEL) },
-      marketData: { selected: env.MARKET_DATA_PROVIDER || "mock", ricequantConfigured: Boolean(env.RICEQUANT_API_KEY && env.RICEQUANT_BASE_URL) },
+      marketData: { selected: env.MARKET_DATA_PROVIDER || "mock", ricequantConfigured: Boolean(env.RICEQUANT_BRIDGE_URL) },
     },
   };
 }
@@ -412,13 +511,18 @@ function safeJson(value: unknown) {
   try { return JSON.parse(String(value ?? "{}")) as unknown; } catch { return null; }
 }
 
-async function logWorkflow(owner: string, module: string, status: string, provider: string, input: unknown, summary?: string, errorCode?: string) {
+async function logWorkflow(owner: string, module: string, status: string, provider: string, input: unknown, summary?: string, errorCode?: string, metrics?: {
+  latencyMs?: number; inputTokens?: number; outputTokens?: number; estimatedCostCny?: number;
+}) {
   const db = getD1();
   const inputHash = await sha256(JSON.stringify(input));
   await db.prepare(`INSERT INTO workflow_runs
-    (id, owner_id, module, status, provider, input_hash, output_summary, error_code, latency_ms, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)`)
-    .bind(`workflow:${crypto.randomUUID()}`, owner, module, status, provider, inputHash, summary ?? null, errorCode ?? null, new Date().toISOString()).run();
+    (id, owner_id, module, status, provider, input_hash, output_summary, error_code, latency_ms,
+     input_tokens, output_tokens, estimated_cost_cny, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+    .bind(`workflow:${crypto.randomUUID()}`, owner, module, status, provider, inputHash, summary ?? null, errorCode ?? null,
+      metrics?.latencyMs ?? 0, metrics?.inputTokens ?? 0, metrics?.outputTokens ?? 0,
+      metrics?.estimatedCostCny ?? null, new Date().toISOString()).run();
 }
 
 export async function compileAndSaveDraft(ownerId: string, input: {
@@ -429,14 +533,32 @@ export async function compileAndSaveDraft(ownerId: string, input: {
   await initializeDemoStore(owner);
   const startedAt = Date.now();
   try {
-    const llm = env.LLM_PROVIDER === "remote"
+    const remoteConfigured = (env.LLM_PROVIDER === "deepseek" || env.LLM_PROVIDER === "remote")
+      && Boolean(env.LLM_API_KEY && env.LLM_BASE_URL && env.LLM_MODEL);
+    const llm = remoteConfigured
       ? new RemoteStructuredLLMProvider({ apiKey: env.LLM_API_KEY, baseUrl: env.LLM_BASE_URL, model: env.LLM_MODEL })
       : new FixtureLLMProvider((_module, requestInput) => compileThesisDraft(requestInput as typeof input));
-    const generated = await llm.generate<typeof input, ThesisDraftPayload>({
+    let generated = await llm.generate<typeof input, ThesisDraftPayload>({
       module: "THESIS_COMPILER", promptVersion: "thesis-compiler-v1", schemaVersion: "thesis-draft-v1",
       input, idempotencyKey: await sha256(`${owner}:${JSON.stringify(input)}`),
     });
-    const payload = generated.output;
+    let payload: ThesisDraftPayload;
+    try {
+      payload = validateThesisDraft(generated.output);
+    } catch (validationError) {
+      if (!(llm instanceof RemoteStructuredLLMProvider)) throw validationError;
+      const repairInput = {
+        ...input,
+        invalidOutput: generated.output,
+        validationErrors: validationError instanceof Error ? validationError.message : "THESIS_SCHEMA_INVALID",
+        repairInstruction: "只修复不符合 Schema 的字段，不增加产品范围外内容。",
+      };
+      generated = await llm.generate<typeof repairInput, ThesisDraftPayload>({
+        module: "THESIS_COMPILER", promptVersion: "thesis-compiler-v1-repair", schemaVersion: "thesis-draft-v1",
+        input: repairInput, idempotencyKey: await sha256(`${owner}:repair:${JSON.stringify(repairInput)}`),
+      });
+      payload = validateThesisDraft(generated.output);
+    }
     const db = getD1();
     const thesisId = thesisIdFor(owner);
     const now = new Date().toISOString();
@@ -450,14 +572,36 @@ export async function compileAndSaveDraft(ownerId: string, input: {
          horizon_max_months, confidence, change_type, structured_payload, created_at)
         VALUES (?, ?, ?, 0, 'DRAFT', ?, ?, ?, ?, ?, 'UPDATE', ?, ?)`)
         .bind(draftId, thesisId, owner, input.inputText, payload.coreThesis, input.horizonMinMonths,
-          input.horizonMaxMonths, input.confidence, JSON.stringify(payload), now),
+          input.horizonMaxMonths, input.confidence, canonicalJson(payload), now),
     ]);
-    await logWorkflow(owner, "THESIS_COMPILER", "SUCCEEDED", generated.provider, input, `生成 ${payload.assumptions.length} 个假设，${Date.now() - startedAt}ms`);
+    await logWorkflow(owner, "THESIS_COMPILER", "SUCCEEDED", generated.provider, input, `生成 ${payload.assumptions.length} 个假设，${Date.now() - startedAt}ms`, undefined, {
+      latencyMs: generated.latencyMs,
+      inputTokens: generated.usage?.inputTokens,
+      outputTokens: generated.usage?.outputTokens,
+      estimatedCostCny: generated.usage && "estimatedCostCny" in generated.usage ? generated.usage.estimatedCostCny : undefined,
+    });
     return readDemoState(owner);
   } catch (error) {
-    await logWorkflow(owner, "THESIS_COMPILER", "FAILED", env.LLM_PROVIDER || "fixture", input, undefined, error instanceof Error ? error.message : "UNKNOWN");
+    await logWorkflow(owner, "THESIS_COMPILER", "FAILED", env.LLM_PROVIDER || "fixture", input, undefined, error instanceof Error ? error.message : "UNKNOWN", { latencyMs: Date.now() - startedAt });
     throw error;
   }
+}
+
+export async function updateDraft(ownerId: string, payloadInput: ThesisDraftPayload) {
+  const owner = normalizeOwner(ownerId);
+  await initializeDemoStore(owner);
+  const payload = validateThesisDraft(payloadInput);
+  const db = getD1();
+  const draft = await db.prepare("SELECT id FROM product_thesis_versions WHERE owner_id = ? AND status = 'DRAFT' ORDER BY created_at DESC LIMIT 1")
+    .bind(owner).first<{ id: string }>();
+  if (!draft) throw new Error("DRAFT_NOT_FOUND");
+  await db.prepare(`UPDATE product_thesis_versions
+    SET input_text = ?, core_thesis = ?, horizon_min_months = ?, horizon_max_months = ?, confidence = ?, structured_payload = ?
+    WHERE id = ? AND owner_id = ? AND status = 'DRAFT'`)
+    .bind(payload.inputText, payload.coreThesis, payload.horizonMinMonths, payload.horizonMaxMonths,
+      payload.confidence, canonicalJson(payload), draft.id, owner).run();
+  await logWorkflow(owner, "THESIS_DRAFT_EDIT", "SUCCEEDED", "user", { draftId: draft.id }, "用户已校验并保存草稿修改");
+  return readDemoState(owner);
 }
 
 export async function createVersionDraft(ownerId: string) {
@@ -491,12 +635,13 @@ export async function confirmDraft(ownerId: string) {
   const maxVersion = await db.prepare("SELECT MAX(version_no) AS max_version FROM product_thesis_versions WHERE owner_id = ? AND status != 'DRAFT'").bind(owner).first<{ max_version: number | null }>();
   const versionNo = Number(maxVersion?.max_version ?? 0) + 1;
   const now = new Date().toISOString();
-  const payload = safeJson(draft.structured_payload) as ThesisDraftPayload;
-  const contentHash = await sha256(String(draft.structured_payload));
+  const payload = validateThesisDraft(safeJson(draft.structured_payload));
+  const canonicalPayload = canonicalJson(payload);
+  const contentHash = await sha256(canonicalPayload);
   await db.batch([
     db.prepare("UPDATE product_thesis_versions SET status = 'SUPERSEDED' WHERE owner_id = ? AND status = 'ACTIVE'").bind(owner),
-    db.prepare(`UPDATE product_thesis_versions SET version_no = ?, status = 'ACTIVE', content_hash = ?, confirmed_at = ?
-      WHERE id = ? AND owner_id = ? AND status = 'DRAFT'`).bind(versionNo, contentHash, now, String(draft.id), owner),
+    db.prepare(`UPDATE product_thesis_versions SET version_no = ?, status = 'ACTIVE', structured_payload = ?, content_hash = ?, confirmed_at = ?
+      WHERE id = ? AND owner_id = ? AND status = 'DRAFT'`).bind(versionNo, canonicalPayload, contentHash, now, String(draft.id), owner),
     db.prepare("UPDATE product_theses SET current_version_id = ?, updated_at = ? WHERE id = ? AND owner_id = ?")
       .bind(String(draft.id), now, String(draft.thesis_id), owner),
   ]);
@@ -531,11 +676,13 @@ export async function importEvidence(ownerId: string, input: {
       const id = `imported-evidence:${crypto.randomUUID()}`;
       return db.prepare(`INSERT INTO imported_evidence
         (id, owner_id, source_document_id, canonical_event_id, title, fact_text, source_excerpt,
-         source_locator, assumption_code, impact, strength, verification, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'UNVERIFIED', ?)`)
+         source_locator, assumption_code, impact, strength, verification, extractor_version, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'UNVERIFIED', 'local-parser-v1', ?)`)
         .bind(id, owner, documentId, `${contentHash}:${index}`, fact.title, fact.factText, fact.sourceExcerpt,
           fact.sourceLocator, fact.assumptionCode, fact.impact, fact.strength, now);
     }),
+    db.prepare(`UPDATE demo_sessions SET review_status = CASE WHEN review_status = 'DEFERRED' THEN 'OPEN' ELSE review_status END,
+      updated_at = ? WHERE id = ? AND owner_id = ?`).bind(now, sessionIdFor(owner), owner),
   ]);
   await logWorkflow(owner, "EVIDENCE_EXTRACTOR", "SUCCEEDED", env.LLM_PROVIDER || "fixture", { documentId, format: input.format }, `导入 ${facts.length} 条事实`);
   return readDemoState(owner);
@@ -547,6 +694,13 @@ export async function saveEvidenceFeedback(ownerId: string, input: {
   const owner = normalizeOwner(ownerId);
   await initializeDemoStore(owner);
   const db = getD1();
+  if (input.feedback === "REASSIGNED") {
+    if (!input.assumptionCode || !input.reason?.trim()) throw new Error("REASSIGNMENT_DETAILS_REQUIRED");
+    const active = await db.prepare("SELECT structured_payload FROM product_thesis_versions WHERE owner_id = ? AND status = 'ACTIVE' ORDER BY version_no DESC LIMIT 1")
+      .bind(owner).first<{ structured_payload: string }>();
+    const payload = active ? safeJson(active.structured_payload) as ThesisDraftPayload | null : null;
+    if (!payload?.assumptions.some((item) => item.code === input.assumptionCode)) throw new Error("ASSUMPTION_NOT_FOUND");
+  }
   const owned = await db.prepare(`SELECT id FROM imported_evidence WHERE id = ? AND owner_id = ?
     UNION ALL SELECT e.id FROM evidence e JOIN demo_sessions s ON s.id = e.session_id WHERE e.id = ? AND s.owner_id = ? LIMIT 1`)
     .bind(input.evidenceId, owner, input.evidenceId, owner).first<{ id: string }>();
@@ -558,6 +712,10 @@ export async function saveEvidenceFeedback(ownerId: string, input: {
       assumption_code = excluded.assumption_code, reason = excluded.reason, created_at = excluded.created_at`)
     .bind(`feedback:${owner}:${input.evidenceId}`, owner, input.evidenceId, input.feedback,
       input.assumptionCode ?? null, input.reason ?? null, new Date().toISOString()).run();
+  const verification = input.feedback === "ACCEPTED" ? "VERIFIED" : input.feedback === "REJECTED" ? "REJECTED" : "UNVERIFIED";
+  await db.prepare(`UPDATE imported_evidence SET verification = ?, assumption_code = COALESCE(?, assumption_code)
+    WHERE id = ? AND owner_id = ?`)
+    .bind(verification, input.assumptionCode ?? null, input.evidenceId, owner).run();
   await logWorkflow(owner, "EVIDENCE_FEEDBACK", "SUCCEEDED", "user", input, input.feedback);
   return readDemoState(owner);
 }
@@ -571,8 +729,8 @@ export async function recordReviewEvent(ownerId: string, eventType: "TRIGGER_DIS
     db.prepare(`INSERT INTO review_events (id, owner_id, session_id, event_type, payload, created_at)
       VALUES (?, ?, ?, ?, ?, ?)`)
       .bind(`review-event:${crypto.randomUUID()}`, owner, sessionId, eventType, JSON.stringify(payload), new Date().toISOString()),
-    db.prepare("UPDATE demo_sessions SET review_status = 'DISMISSED', updated_at = ? WHERE id = ? AND owner_id = ?")
-      .bind(new Date().toISOString(), sessionId, owner),
+    db.prepare("UPDATE demo_sessions SET review_status = ?, updated_at = ? WHERE id = ? AND owner_id = ?")
+      .bind(eventType === "TRIGGER_DISPUTED" ? "DISPUTED" : "DISMISSED", new Date().toISOString(), sessionId, owner),
   ]);
   return readDemoState(owner);
 }
@@ -582,14 +740,18 @@ export async function advanceScenario(ownerId: string, expectedCurrentPoint: num
   await initializeDemoStore(owner);
   const db = getD1();
   const sessionId = sessionIdFor(owner);
-  const session = await db.prepare("SELECT current_point FROM demo_sessions WHERE id = ? AND owner_id = ?").bind(sessionId, owner).first<{ current_point: number }>();
+  const session = await db.prepare("SELECT current_point, scenario_id FROM demo_sessions WHERE id = ? AND owner_id = ?").bind(sessionId, owner).first<{ current_point: number; scenario_id: string }>();
   if (!session) throw new Error("Demo session not found");
+  if (session.scenario_id === "cn-fund-empty-v1") throw new Error("SCENARIO_DATA_MISSING");
   if (session.current_point !== expectedCurrentPoint) throw new Error("SCENARIO_POINT_CONFLICT");
   if (session.current_point >= 6) return readDemoState(owner);
   const nextPoint = session.current_point + 1;
   const rule = getRuleState(nextPoint);
   const reviewStatus = nextPoint >= 5 ? "OPEN" : "NONE";
   const now = new Date().toISOString();
+  const activeVersion = nextPoint >= 5
+    ? await db.prepare("SELECT id FROM product_thesis_versions WHERE owner_id = ? AND status = 'ACTIVE' ORDER BY version_no DESC LIMIT 1").bind(owner).first<{ id: string }>()
+    : null;
   await db.batch([
     db.prepare("UPDATE demo_sessions SET current_point = ?, review_status = ?, updated_at = ? WHERE id = ? AND owner_id = ?")
       .bind(nextPoint, reviewStatus, now, sessionId, owner),
@@ -598,6 +760,11 @@ export async function advanceScenario(ownerId: string, expectedCurrentPoint: num
       VALUES (?, ?, ?, ?, ?, ?, ?)`)
       .bind(`rule-eval:${sessionId}:${nextPoint}`, sessionId, nextPoint, rule.status, rule.current, rule.required,
         nextPoint >= 5 ? "收入增速连续两个季度低于 20%，正式触发复盘。" : nextPoint >= 4 ? "收入增速首次低于 20%，当前进度 1/2。" : "当前数据未满足失效条件。"),
+    ...(nextPoint === 5 && activeVersion ? [
+      db.prepare(`INSERT INTO review_events (id, owner_id, session_id, event_type, payload, created_at)
+        VALUES (?, ?, ?, 'REVIEW_OPENED', ?, ?)`)
+        .bind(`review-opened:${sessionId}:${nextPoint}`, owner, sessionId, JSON.stringify({ thesisVersionId: activeVersion.id, triggerPoint: nextPoint }), now),
+    ] : []),
   ]);
   await logWorkflow(owner, "SCENARIO_ADVANCE", "SUCCEEDED", "mock", { nextPoint }, rule.label);
   return readDemoState(owner);
@@ -609,7 +776,6 @@ export async function resetScenario(ownerId: string) {
   const db = getD1();
   const sessionId = sessionIdFor(owner);
   await db.batch([
-    db.prepare("DELETE FROM decision_snapshots WHERE session_id = ?").bind(sessionId),
     db.prepare("DELETE FROM rule_evaluations WHERE session_id = ?").bind(sessionId),
     db.prepare("DELETE FROM review_events WHERE owner_id = ? AND session_id = ?").bind(owner, sessionId),
     db.prepare(`UPDATE demo_sessions SET current_point = 0, thesis_confirmed = 1, review_status = 'NONE',
@@ -638,6 +804,8 @@ export async function deferReview(ownerId: string, requestedEvidence: string, de
   await initializeDemoStore(owner);
   const db = getD1();
   const sessionId = sessionIdFor(owner);
+  const deferredTimestamp = Date.parse(deferredUntil);
+  if (!Number.isFinite(deferredTimestamp) || deferredTimestamp <= Date.now()) throw new Error("INVALID_DEFERRED_UNTIL");
   const payload = { requestedEvidence, deferredUntil };
   await db.batch([
     db.prepare("UPDATE demo_sessions SET review_status = 'DEFERRED', decision_reason = ?, updated_at = ? WHERE id = ? AND owner_id = ?")
@@ -650,19 +818,37 @@ export async function deferReview(ownerId: string, requestedEvidence: string, de
 }
 
 export async function createDecisionSnapshot(ownerId: string, input: {
-  action: "HOLD" | "ADD" | "REDUCE" | "EXIT"; reason: string; confidence: number;
+  action: "HOLD" | "ADD" | "REDUCE" | "EXIT"; reason: string; confidence: number; challengerEvidence?: string;
 }) {
   const owner = normalizeOwner(ownerId);
   await initializeDemoStore(owner);
   const current = await readDemoState(owner);
   if (current.session.currentPoint < 5) throw new Error("INVALID_STATE_TRANSITION");
   if (current.session.currentPoint >= 6) return current;
+  if (current.session.reviewStatus === "DEFERRED") throw new Error("REVIEW_DEFERRED");
+  if (current.session.reviewStatus === "DISMISSED") throw new Error("INVALID_STATE_TRANSITION");
+  if (input.action === "ADD" && current.rule.status === "TRIGGERED" && !input.challengerEvidence?.trim()) {
+    throw new Error("CHALLENGER_EVIDENCE_REQUIRED");
+  }
   const db = getD1();
   const createdAt = new Date().toISOString();
-  const thesisVersionId = current.thesis?.id ?? fixtureVersionIdFor(owner);
-  const frozenPayload = JSON.stringify({ thesisVersionId, thesis: current.thesis, action: input.action,
+  const snapshotThesis = current.reviewThesis ?? current.thesis;
+  const thesisVersionId = snapshotThesis?.id ?? fixtureVersionIdFor(owner);
+  const market = new MockMarketDataProvider();
+  const priceSeries = await market.getMetricSeries({
+    providerSymbol: "DEMO-CN-01", metricKey: "price_close", period: "DAY", from: "2026-08-11", to: "2026-08-11",
+  });
+  const price = priceSeries.at(-1);
+  if (!price) throw new Error("PRICE_SNAPSHOT_UNAVAILABLE");
+  const priceSnapshot = {
+    value: price.value,
+    currency: price.unit,
+    observedAt: price.periodEnd,
+    source: `${market.providerName}:${price.providerRecordId}`,
+  };
+  const frozenPayload = canonicalJson({ thesisVersionId, thesis: snapshotThesis, action: input.action,
     reason: input.reason, confidence: input.confidence, health: current.health, rule: current.rule,
-    evidence: current.evidence, createdAt });
+    evidence: current.evidence, priceSnapshot, challengerEvidence: input.challengerEvidence?.trim() || null, createdAt });
   const contentHash = await sha256(frozenPayload);
   const id = `snapshot:${crypto.randomUUID()}`;
   const sessionId = sessionIdFor(owner);
