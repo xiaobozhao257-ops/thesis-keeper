@@ -34,6 +34,10 @@ Thesis Keeper 的核心价值不是预测涨跌，而是让用户在信息变化
 - 证据时效最多扣 10 分且不单独改变状态；空基金模板强制为 0，`DATA_MISSING` 不得表现为恶化。
 - RQData Bridge 的 `METRIC_SPECS` 单位与周期必须与 `metricCatalog` 逐条一致；财务序列必须以查询窗口右端为 point-in-time 查询日；缺基期或上年同期非正时不产生观测，不得填 0 或前值。
 - 所有写操作按服务端身份检查 `owner_id`。
+- 真实论点使用 `data_mode = 'REAL'`，T0–T6 演示论点使用 `data_mode = 'DEMO'`；组合、版本和详情查询不得混用两类数据。
+- Alpha 论点的读写必须同时校验 `owner_id` 与 `thesis_id`；不得用"按 owner 取最新 Active Version"代替论点边界。
+- 真实论点在尚无已确认 Observation 时必须显示 `DATA_MISSING`，不得继承 Demo 的 Health、Evidence 或 Trigger。
+- M1 只承诺本地 Alpha；RQData 只是本地验证数据源，不把本机 Bridge 描述成线上可用服务。
 
 ## 自动化 Release Gate
 
@@ -59,7 +63,10 @@ npm run rqdata:test
 8. 在新建论点页搜索境内股票或场内基金，选择结果后确认名称、规范代码和资产类型同步填入。
 9. 在新建论点页把买入依据改为“价格动量”，确认未写判错条件时无法编译；补写后可以正常生成草稿。
 10. 在 `/portfolio` 的“计划外行动”记录一次 ADD，推动因素选“价格涨跌”，确认页面并排显示当时仍成立的假设条数且未提示“复盘已完成”，`current_point` 不变。
-11. 在 `/decisions` 确认该行带 `UNPLANNED` 标记与“非论点驱动”提示；累计不足 3 笔时行为镜子显式说明样本不足。
+11. 在 `/decisions` 确认该行带 `UNPLANNED` 标记与"非论点驱动"提示；累计不足 3 笔时行为镜子显式说明样本不足。
+12. 打开 `/portfolio`，确认真实组合不显示华星智算或 T0–T6；`/demo` 仍可重放原场景。
+13. 在 `/theses/new` 创建两个不同标的的草稿，只确认其中一个；返回组合后应同时看到一个 V1 和一个待确认草稿。
+14. 在无观测的真实论点详情中确认 Health 与 Rule 都是 `DATA_MISSING`，不显示 `31% → 19% → 17%`。
 
 ## 明确不进入 P0
 

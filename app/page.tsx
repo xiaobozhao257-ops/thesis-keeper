@@ -1,5 +1,5 @@
-import { ThesisKeeperApp } from "./components/ThesisKeeperApp";
+import { AlphaPortfolioApp } from "./components/AlphaApp";
 
 export default function Home() {
-  return <ThesisKeeperApp view="portfolio" />;
+  return <AlphaPortfolioApp />;
 }

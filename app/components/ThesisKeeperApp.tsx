@@ -142,7 +142,7 @@ const initialState: DemoState = {
 };
 
 const nav = [
-  { view: "portfolio", href: "/portfolio", index: "01", label: "投资组合" },
+  { view: "portfolio", href: "/demo", index: "01", label: "Demo 总览" },
   { view: "new-thesis", href: "/theses/new", index: "02", label: "新建论点" },
   { view: "thesis", href: "/theses/demo-thesis", index: "03", label: "论点详情" },
   { view: "evidence", href: "/evidence", index: "04", label: "证据中心" },
@@ -216,7 +216,7 @@ export function ThesisKeeperApp({ view }: { view: View }) {
   return (
     <div className="app-frame">
       <aside className="side-rail">
-        <Link className="brand" href="/portfolio" aria-label="Thesis Keeper 首页">
+        <Link className="brand" href="/demo" aria-label="Thesis Keeper Demo 首页">
           <span className="brand-mark">TK</span>
           <span><strong>THESIS</strong><strong>KEEPER</strong></span>
         </Link>

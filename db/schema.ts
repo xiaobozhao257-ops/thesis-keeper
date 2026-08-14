@@ -39,8 +39,13 @@ export const decisionSnapshots = sqliteTable("decision_snapshots", {
 export const productTheses = sqliteTable("product_theses", {
   id: text("id").primaryKey(), ownerId: text("owner_id").notNull(), instrumentName: text("instrument_name").notNull(),
   canonicalCode: text("canonical_code").notNull(), assetType: text("asset_type").notNull(), currentVersionId: text("current_version_id"),
+  dataMode: text("data_mode").notNull().default("REAL"), status: text("status").notNull().default("ACTIVE"),
+  predecessorThesisId: text("predecessor_thesis_id"), closedAt: text("closed_at"),
   createdAt: text("created_at").notNull(), updatedAt: text("updated_at").notNull(),
-}, (table) => [index("idx_product_theses_owner").on(table.ownerId)]);
+}, (table) => [
+  index("idx_product_theses_owner").on(table.ownerId),
+  index("idx_product_theses_owner_mode_status").on(table.ownerId, table.dataMode, table.status),
+]);
 
 export const productThesisVersions = sqliteTable("product_thesis_versions", {
   id: text("id").primaryKey(), thesisId: text("thesis_id").notNull(), ownerId: text("owner_id").notNull(),

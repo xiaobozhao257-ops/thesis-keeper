@@ -1,5 +1,6 @@
-import { ThesisKeeperApp } from "../../components/ThesisKeeperApp";
+import { AlphaThesisDetailApp } from "../../components/AlphaApp";
 
-export default function ThesisPage() {
-  return <ThesisKeeperApp view="thesis" />;
+export default async function ThesisPage({ params }: { params: Promise<{ thesisId: string }> }) {
+  const { thesisId } = await params;
+  return <AlphaThesisDetailApp thesisId={thesisId} />;
 }

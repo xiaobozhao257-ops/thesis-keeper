@@ -106,6 +106,10 @@ const schemaStatements = [
     canonical_code TEXT NOT NULL,
     asset_type TEXT NOT NULL,
     current_version_id TEXT,
+    data_mode TEXT NOT NULL DEFAULT 'REAL',
+    status TEXT NOT NULL DEFAULT 'ACTIVE',
+    predecessor_thesis_id TEXT,
+    closed_at TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
   )`,
@@ -297,9 +301,11 @@ export async function initializeDemoStore(ownerId = DEFAULT_OWNER) {
       VALUES (?, ?, 1, 'ACTIVE', ?, 80, ?, ?)`)
       .bind(versionId, sessionId, payload.coreThesis, payloadHash, "2026-02-12T00:00:00Z"),
     db.prepare(`INSERT OR IGNORE INTO product_theses
-      (id, owner_id, instrument_name, canonical_code, asset_type, current_version_id, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
+      (id, owner_id, instrument_name, canonical_code, asset_type, current_version_id, data_mode, status, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, 'DEMO', 'ACTIVE', ?, ?)`)
       .bind(thesisId, owner, payload.instrumentName, payload.canonicalCode, payload.assetType, versionId, now, now),
+    db.prepare("UPDATE product_theses SET data_mode = 'DEMO' WHERE id = ? AND owner_id = ?")
+      .bind(thesisId, owner),
     db.prepare(`INSERT OR IGNORE INTO product_thesis_versions
       (id, thesis_id, owner_id, version_no, status, input_text, core_thesis,
        horizon_min_months, horizon_max_months, confidence, change_type, structured_payload,
@@ -326,10 +332,12 @@ async function ensureProvenanceColumns(db: D1Database) {
   const importedColumns = await db.prepare("PRAGMA table_info(imported_evidence)").all<{ name: string }>();
   const workflowColumns = await db.prepare("PRAGMA table_info(workflow_runs)").all<{ name: string }>();
   const snapshotColumns = await db.prepare("PRAGMA table_info(decision_snapshots)").all<{ name: string }>();
+  const productThesisColumns = await db.prepare("PRAGMA table_info(product_theses)").all<{ name: string }>();
   const existingEvidence = new Set(evidenceColumns.results.map((row) => row.name));
   const existingImported = new Set(importedColumns.results.map((row) => row.name));
   const existingWorkflow = new Set(workflowColumns.results.map((row) => row.name));
   const existingSnapshot = new Set(snapshotColumns.results.map((row) => row.name));
+  const existingProductThesis = new Set(productThesisColumns.results.map((row) => row.name));
   const additions = [
     ...[
       ["source_publisher", "TEXT NOT NULL DEFAULT ''"],
@@ -351,8 +359,15 @@ async function ensureProvenanceColumns(db: D1Database) {
       ["record_type", "TEXT NOT NULL DEFAULT 'PLANNED_REVIEW'"],
       ["trigger_source", "TEXT"],
     ].filter(([name]) => !existingSnapshot.has(name)).map(([name, definition]) => db.prepare(`ALTER TABLE decision_snapshots ADD COLUMN ${name} ${definition}`)),
+    ...[
+      ["data_mode", "TEXT NOT NULL DEFAULT 'REAL'"],
+      ["status", "TEXT NOT NULL DEFAULT 'ACTIVE'"],
+      ["predecessor_thesis_id", "TEXT"],
+      ["closed_at", "TEXT"],
+    ].filter(([name]) => !existingProductThesis.has(name)).map(([name, definition]) => db.prepare(`ALTER TABLE product_theses ADD COLUMN ${name} ${definition}`)),
   ];
   if (additions.length) await db.batch(additions);
+  await db.prepare("CREATE INDEX IF NOT EXISTS idx_product_theses_owner_mode_status ON product_theses(owner_id, data_mode, status)").run();
 }
 
 async function persistVersionChildren(db: D1Database, versionId: string, payload: ThesisDraftPayload) {
