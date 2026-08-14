@@ -12,8 +12,10 @@
     "test": "npm run build && node --experimental-strip-types --test tests/domain.test.mjs tests/database-invariants.test.mjs tests/migration.test.mjs tests/providers-and-ingestion.test.mjs tests/rendered-html.test.mjs",
     "lint": "eslint . --ignore-pattern dist --ignore-pattern .next",
     "db:generate": "drizzle-kit generate",
-    "rqdata:setup": "powershell -ExecutionPolicy Bypass -File scripts/setup-rqdata.ps1",
-    "rqdata:start": "powershell -ExecutionPolicy Bypass -File scripts/start-rqdata.ps1"
+    "rqdata:setup": "node scripts/rqdata.mjs setup",
+    "rqdata:start": "node scripts/rqdata.mjs start",
+    "rqdata:test": "node scripts/rqdata.mjs test",
+    "env:check": "node scripts/check-env.mjs"
   },
   "dependencies": {
     "drizzle-orm": "0.45.2",

@@ -358,6 +358,53 @@ textarea { width: 100%; min-height: 150px; padding: 16px; resize: vertical; bord
 .app-footer span { font: 9px/1.4 ui-monospace, monospace; }
 .app-footer p { max-width: 650px; margin: 0; text-align: right; font-size: 9px; line-height: 1.5; }
 
+/* 建仓纪律：买入依据、可证伪表述与用户自己写下的退出计划 */
+.entry-discipline { margin-top: 22px; padding: 20px; border: 1px solid var(--line); background: var(--surface); display: grid; gap: 11px; }
+.entry-discipline > span { color: var(--muted); font: 700 9px/1 ui-monospace, monospace; letter-spacing: .08em; }
+.entry-discipline label { margin: 6px 0 0; font-weight: 700; font-size: 12px; }
+.entry-discipline select { min-height: 42px; border: 1px solid var(--line); background: #fffefa; color: var(--ink); font-size: 12px; padding: 0 10px; }
+.entry-discipline > small { color: var(--muted); font-size: 11px; line-height: 1.6; }
+.entry-discipline textarea { min-height: 96px; }
+
+/* 计划外行动：任何时点都能记录，系统不拦截 */
+.unplanned-teaser { padding: 20px 24px; border: 1px solid var(--line); background: var(--surface); display: flex; align-items: center; justify-content: space-between; gap: 24px; }
+.unplanned-teaser strong { font-family: Georgia, "Songti SC", serif; font-size: 17px; }
+.unplanned-teaser p { max-width: 620px; margin: 6px 0 0; color: var(--muted); font-size: 11px; line-height: 1.7; }
+.unplanned-panel { padding: 24px; border: 1px solid var(--line); background: var(--surface); display: grid; gap: 18px; }
+.unplanned-panel > label { font-weight: 700; font-size: 12px; }
+.unplanned-panel input[type="range"] { width: 100%; accent-color: var(--accent); }
+.unplanned-panel > small { color: var(--muted); font-size: 10px; }
+.trigger-picker { margin: 0; padding: 0; border: 0; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.trigger-picker legend { padding: 0 0 10px; font-weight: 700; font-size: 12px; }
+.trigger-picker label { display: flex; align-items: flex-start; gap: 10px; padding: 13px 15px; border: 1px solid var(--line); background: #fffefa; cursor: pointer; }
+.trigger-picker label.active { border-color: var(--ink); background: #ece9df; }
+.trigger-picker input { margin-top: 3px; accent-color: var(--accent); }
+.trigger-picker span { display: grid; gap: 4px; color: var(--muted); font-size: 10px; line-height: 1.6; }
+.trigger-picker strong { color: var(--ink); font-size: 12px; }
+.mirror-note { padding: 16px 20px; border-left: 3px solid var(--green); background: rgba(46,109,81,.07); }
+.mirror-note.off-thesis { border-left-color: var(--amber); background: rgba(163,108,24,.08); }
+.mirror-note > span { display: block; margin-bottom: 7px; color: var(--muted); font: 9px/1 ui-monospace, monospace; }
+.mirror-note strong { font-size: 13px; }
+.mirror-note p { margin: 7px 0 0; color: var(--muted); font-size: 11px; line-height: 1.7; }
+
+/* 行为镜子：只呈现计数与中位数，不做评价 */
+.mirror-insufficient { padding: 24px; border: 1px dashed var(--line); background: var(--surface); }
+.mirror-insufficient strong { font-family: Georgia, "Songti SC", serif; font-size: 19px; }
+.mirror-insufficient p { max-width: 640px; margin: 8px 0 0; color: var(--muted); font-size: 11px; line-height: 1.75; }
+.mirror-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1px; background: var(--line); border: 1px solid var(--line); }
+.mirror-grid article { padding: 20px; background: var(--surface); display: grid; align-content: start; gap: 7px; }
+.mirror-grid article > span { color: var(--muted); font: 9px/1.4 ui-monospace, monospace; text-transform: uppercase; }
+.mirror-grid strong { font: 26px/1 Georgia, serif; }
+.mirror-grid small { color: var(--muted); font-size: 10px; line-height: 1.7; }
+.mirror-breakdown { grid-column: 1 / -1; }
+.mirror-breakdown ul { margin: 0; padding: 0; list-style: none; display: grid; gap: 6px; }
+.mirror-breakdown li { display: grid; grid-template-columns: minmax(0, 1fr) 70px 110px; gap: 10px; padding-bottom: 6px; border-bottom: 1px solid var(--line); font-size: 11px; }
+.mirror-breakdown b { font-weight: 700; }
+.mirror-breakdown i { font-style: normal; font-family: ui-monospace, monospace; }
+.mirror-breakdown em { color: var(--muted); font-style: normal; font-size: 10px; text-align: right; }
+.trigger-tag { margin: 0 0 8px; color: var(--green); font-size: 11px; font-weight: 700; }
+.trigger-tag.off-thesis { color: var(--amber); }
+
 @media (max-width: 1100px) {
   .app-frame { grid-template-columns: 190px minmax(0, 1fr); }
   .main-canvas { padding: 0 28px; }
@@ -400,6 +447,11 @@ textarea { width: 100%; min-height: 150px; padding: 16px; resize: vertical; bord
   .then-now { grid-template-columns: 1fr; }
   .versus { display: none; }
   .action-picker { grid-template-columns: 1fr 1fr; }
+  .trigger-picker { grid-template-columns: 1fr; }
+  .mirror-grid { grid-template-columns: 1fr; }
+  .mirror-breakdown li { grid-template-columns: minmax(0, 1fr) 60px; }
+  .mirror-breakdown em { grid-column: 1 / -1; text-align: left; }
+  .unplanned-teaser { align-items: stretch; flex-direction: column; }
   .decision-actions { align-items: stretch; flex-direction: column; }
   .decision-actions > div { flex-direction: column; }
   .decision-actions input { min-height: 42px; min-width: 0; }

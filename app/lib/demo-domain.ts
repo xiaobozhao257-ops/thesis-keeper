@@ -1,6 +1,8 @@
 export type HealthStatus = "HEALTHY" | "ATTENTION" | "MUST_REVIEW";
 export type EvidenceImpact = "SUPPORT" | "WEAKEN" | "CONTRADICT";
 export type DecisionAction = "HOLD" | "ADD" | "REDUCE" | "EXIT" | "DEFER";
+export type DecisionRecordType = "PLANNED_REVIEW" | "UNPLANNED_ACTION";
+export type TriggerSourceCode = "ASSUMPTION_CHANGE" | "PRICE_MOVE" | "MARKET_OR_SECTOR" | "NEWS_OR_OPINION";
 
 export type EvidenceItem = {
   id: string;
@@ -37,6 +39,42 @@ export const metricSeries = [
   { label: "T4", value: 19 },
   { label: "T5", value: 17 },
 ];
+
+/**
+ * 计划外行动必须声明是什么在推动这次操作。系统不阻止任何一项，只是把它和用户
+ * 自己写下的理由并排放在一起。只有 ASSUMPTION_CHANGE 属于论点驱动。
+ */
+export const triggerSources = [
+  { code: "ASSUMPTION_CHANGE", label: "假设发生变化", note: "有新事实改变了你当初写下的某条假设。" },
+  { code: "PRICE_MOVE", label: "价格涨跌", note: "标的价格本身的波动，不是假设的变化。" },
+  { code: "MARKET_OR_SECTOR", label: "大盘或板块", note: "指数、板块或市场情绪层面的变化。" },
+  { code: "NEWS_OR_OPINION", label: "新闻或他人观点", note: "看到的消息、荐股，或社群里的讨论。" },
+] as const;
+
+/** 买入依据。后三类属于弱依据，冻结版本时必须写出可被证伪的表述。 */
+export const entryBasisTypes = [
+  { code: "FUNDAMENTAL_CHANGE", label: "基本面变化", weak: false, note: "经营、行业或竞争格局出现了可核验的变化。" },
+  { code: "VALUATION", label: "估值", weak: false, note: "当前价格相对你的估值判断有偏离。" },
+  { code: "PRICE_MOMENTUM", label: "价格动量", weak: true, note: "主要因为它在涨。" },
+  { code: "NEWS", label: "消息", weak: true, note: "主要因为看到了某条消息。" },
+  { code: "RECOMMENDATION", label: "他人推荐", weak: true, note: "主要因为别人看好。" },
+] as const;
+
+export function triggerSourceLabel(code: string) {
+  return triggerSources.find((item) => item.code === code)?.label ?? code;
+}
+
+export function isThesisDrivenTrigger(code: string | null | undefined) {
+  return code === "ASSUMPTION_CHANGE";
+}
+
+export function entryBasisLabel(code: string) {
+  return entryBasisTypes.find((item) => item.code === code)?.label ?? code;
+}
+
+export function isWeakEntryBasis(code: string | null | undefined) {
+  return entryBasisTypes.some((item) => item.code === code && item.weak);
+}
 
 export type MetricObservation = { value: number; unit: string; periodEnd: string };
 export type MetricRule = {
@@ -121,11 +159,22 @@ export const seededEvidence: EvidenceItem[] = [
   },
 ];
 
-export function calculateHealth(currentPoint: number) {
+/** 证据时效扣分档位。天数越大扣得越多，上限 10，与 UI 的 breakdown 上限一致。 */
+export const STALENESS_BANDS = [
+  { minDays: 30, penalty: 10, note: "超过 30 天没有补充任何证据" },
+  { minDays: 14, penalty: 4, note: "超过 14 天没有补充任何证据" },
+] as const;
+
+export function calculateStalenessPenalty(daysSinceLastEvidence: number) {
+  if (!Number.isFinite(daysSinceLastEvidence) || daysSinceLastEvidence < 0) return 0;
+  return STALENESS_BANDS.find((band) => daysSinceLastEvidence >= band.minDays)?.penalty ?? 0;
+}
+
+export function calculateHealth(currentPoint: number, daysSinceLastEvidence = 0) {
   const metricPenalty = currentPoint >= 5 ? 24 : currentPoint >= 4 ? 12 : 0;
   const evidencePenalty = currentPoint >= 3 ? 8 : 0;
   const triggerPenalty = currentPoint >= 5 ? 40 : currentPoint >= 4 ? 15 : 0;
-  const stalenessPenalty = 0;
+  const stalenessPenalty = calculateStalenessPenalty(daysSinceLastEvidence);
   const score = Math.max(0, 100 - metricPenalty - evidencePenalty - triggerPenalty - stalenessPenalty);
   const evidenceAttention = currentPoint >= 3;
   const status: HealthStatus = currentPoint >= 5 || score < 40
@@ -157,6 +206,20 @@ export function getScenarioRuleState(scenarioId: string, currentPoint: number) {
     : { status: "DATA_MISSING", current: 0, required: 2, label: "数据缺失" };
 }
 
+/**
+ * 记录计划外行动时冻结的假设状态。这不是评价，只是把「你当初写下的条件现在成立几条」
+ * 摆在用户声明的理由旁边。
+ */
+export function assumptionStatusAt(currentPoint: number) {
+  const states = assumptions.map((item) => item.stateAt[Math.min(Math.max(currentPoint, 0), 5)]);
+  return {
+    total: states.length,
+    supporting: states.filter((state) => state === "支持").length,
+    mixed: states.filter((state) => state === "混合").length,
+    weakened: states.filter((state) => state === "削弱").length,
+  };
+}
+
 export function stateLabel(status: HealthStatus) {
   return status === "HEALTHY" ? "健康" : status === "ATTENTION" ? "需关注" : "必须复盘";
 }
@@ -164,3 +227,94 @@ export function stateLabel(status: HealthStatus) {
 export function impactLabel(impact: EvidenceImpact) {
   return impact === "SUPPORT" ? "支持" : impact === "WEAKEN" ? "削弱" : "直接矛盾";
 }
+
+/** 行为镜子的最小样本量。低于此值只展示已记录条数，不给出任何倾向性描述。 */
+export const BEHAVIOR_MIRROR_MIN_SAMPLE = 3;
+
+export type BehaviorDecision = {
+  id: string;
+  action: string;
+  recordType: DecisionRecordType;
+  triggerSource: string | null;
+  confidence: number;
+  healthScore: number;
+  ruleStatus: string | null;
+  counterEvidenceCount: number;
+  createdAt: string;
+};
+
+function daysBetween(fromIso: string, toIso: string) {
+  const from = Date.parse(fromIso);
+  const to = Date.parse(toIso);
+  if (!Number.isFinite(from) || !Number.isFinite(to)) return null;
+  return Math.max(0, Math.round((to - from) / 86_400_000));
+}
+
+function median(values: number[]) {
+  if (!values.length) return null;
+  const ordered = [...values].sort((left, right) => left - right);
+  const middle = Math.floor(ordered.length / 2);
+  return ordered.length % 2 ? ordered[middle] : Math.round((ordered[middle - 1] + ordered[middle]) / 2);
+}
+
+/**
+ * 把已冻结的决策记录汇总成事实统计。这里只做计数和中位数，不做评价：
+ * 判断「这样好不好」是用户自己的事，产品只负责让他看见。
+ */
+export function summarizeBehavior(input: {
+  decisions: BehaviorDecision[];
+  thesisConfirmedAt: string | null;
+  horizonMinMonths: number | null;
+  horizonMaxMonths: number | null;
+  now?: string;
+}) {
+  const now = input.now ?? new Date().toISOString();
+  const ordered = [...input.decisions].sort((left, right) => left.createdAt.localeCompare(right.createdAt));
+  const decisionCount = ordered.length;
+  const unplanned = ordered.filter((item) => item.recordType === "UNPLANNED_ACTION");
+  const positionChanges = ordered.filter((item) => item.action !== "HOLD");
+  const thesisDriven = ordered.filter((item) => item.recordType === "PLANNED_REVIEW" || isThesisDrivenTrigger(item.triggerSource));
+
+  const triggerBreakdown = triggerSources.map((source) => ({
+    code: source.code,
+    label: source.label,
+    count: unplanned.filter((item) => item.triggerSource === source.code).length,
+    thesisDriven: isThesisDrivenTrigger(source.code),
+  }));
+
+  const afterTrigger = ordered.filter((item) => item.ruleStatus === "TRIGGERED");
+  const holdAfterTrigger = afterTrigger.filter((item) => item.action === "HOLD");
+  const gaps = ordered.slice(1).map((item, index) => daysBetween(ordered[index].createdAt, item.createdAt)).filter((value): value is number => value !== null);
+  const average = (values: number[]) => values.length ? Math.round(values.reduce((sum, value) => sum + value, 0) / values.length) : null;
+
+  const firstExit = ordered.find((item) => item.action === "EXIT");
+  const holdingDays = input.thesisConfirmedAt ? daysBetween(input.thesisConfirmedAt, firstExit?.createdAt ?? now) : null;
+  const declaredMinDays = input.horizonMinMonths === null ? null : Math.round(input.horizonMinMonths * 30.4);
+  const exitedBeforeHorizon = firstExit && holdingDays !== null && declaredMinDays !== null ? holdingDays < declaredMinDays : null;
+
+  return {
+    decisionCount,
+    sampleSufficient: decisionCount >= BEHAVIOR_MIRROR_MIN_SAMPLE,
+    unplannedCount: unplanned.length,
+    unplannedShare: decisionCount ? Math.round((unplanned.length / decisionCount) * 100) : 0,
+    positionChangeCount: positionChanges.length,
+    thesisDrivenCount: thesisDriven.length,
+    thesisDrivenShare: decisionCount ? Math.round((thesisDriven.length / decisionCount) * 100) : 0,
+    triggerBreakdown,
+    afterTriggerCount: afterTrigger.length,
+    holdAfterTriggerCount: holdAfterTrigger.length,
+    holdAfterTriggerWithCounterEvidence: holdAfterTrigger.filter((item) => item.counterEvidenceCount > 0).length,
+    averageConfidence: average(ordered.map((item) => item.confidence)),
+    averageConfidenceUnplanned: average(unplanned.map((item) => item.confidence)),
+    averageConfidencePlanned: average(ordered.filter((item) => item.recordType === "PLANNED_REVIEW").map((item) => item.confidence)),
+    medianDaysBetweenDecisions: median(gaps),
+    declaredHorizonMonths: input.horizonMinMonths === null || input.horizonMaxMonths === null
+      ? null
+      : { min: input.horizonMinMonths, max: input.horizonMaxMonths },
+    holdingDays,
+    exited: Boolean(firstExit),
+    exitedBeforeHorizon,
+  };
+}
+
+export type BehaviorMirror = ReturnType<typeof summarizeBehavior>;

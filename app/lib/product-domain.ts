@@ -1,5 +1,8 @@
 import type { AssetType } from "../providers/market/MarketDataProvider";
+import { entryBasisTypes, isWeakEntryBasis } from "./demo-domain.ts";
 import { z } from "zod";
+
+export type EntryBasisCode = (typeof entryBasisTypes)[number]["code"];
 
 export type ThesisDraftPayload = {
   instrumentName: string;
@@ -10,6 +13,13 @@ export type ThesisDraftPayload = {
   horizonMinMonths: number;
   horizonMaxMonths: number;
   confidence: number;
+  /**
+   * 建仓纪律。基本面变化和估值属于可论证依据；价格动量、消息、他人推荐属于弱依据，
+   * 必须同时写下可被证伪的表述（「若 X 到 Y 时点仍未发生，说明我判断错了」）。
+   */
+  entryBasis?: { type: EntryBasisCode; falsifier: string };
+  /** 用户自己写下的退出计划，不是系统给出的交易建议。 */
+  exitPlan?: string;
   assumptions: Array<{ code: string; title: string; description: string; weight: number }>;
   metrics: Array<{ key: string; name: string; unit: string; period: string; assumptionCode: string }>;
   risks: Array<{ title: string; description: string; assumptionCode?: string }>;
@@ -26,6 +36,8 @@ export type ThesisDraftPayload = {
   clarificationQuestions: string[];
   fuzzyExpressions: string[];
 };
+
+export const entryBasisCodes = entryBasisTypes.map((item) => item.code) as [EntryBasisCode, ...EntryBasisCode[]];
 
 const assumptionSchema = z.object({
   code: z.string().trim().min(1).max(20),
@@ -53,6 +65,11 @@ const ruleSchema = z.object({
   action: z.enum(["MUST_REVIEW", "ATTENTION_ONLY"]),
 });
 
+export const entryBasisSchema = z.object({
+  type: z.enum(entryBasisCodes),
+  falsifier: z.string().trim().max(600),
+});
+
 export const thesisDraftSchema = z.object({
   instrumentName: z.string().trim().min(1).max(80),
   canonicalCode: z.string().trim().min(2).max(24),
@@ -62,6 +79,8 @@ export const thesisDraftSchema = z.object({
   horizonMinMonths: z.number().int().min(1).max(120),
   horizonMaxMonths: z.number().int().min(1).max(240),
   confidence: z.number().int().min(0).max(100),
+  entryBasis: entryBasisSchema.optional(),
+  exitPlan: z.string().trim().max(1000).optional(),
   assumptions: z.array(assumptionSchema).min(1).max(10),
   metrics: z.array(metricSchema).max(20),
   risks: z.array(z.object({
@@ -75,6 +94,13 @@ export const thesisDraftSchema = z.object({
 }).superRefine((draft, context) => {
   if (draft.canonicalCode !== "CN.DEMO.HXZS" && !/^\d{6}\.(XSHG|XSHE)$/.test(draft.canonicalCode)) {
     context.addIssue({ code: "custom", path: ["canonicalCode"], message: "P0 仅支持 XSHG/XSHE 境内交易所六位代码" });
+  }
+  if (draft.entryBasis && isWeakEntryBasis(draft.entryBasis.type) && draft.entryBasis.falsifier.trim().length < 8) {
+    context.addIssue({
+      code: "custom",
+      path: ["entryBasis", "falsifier"],
+      message: "价格动量、消息或他人推荐属于弱依据，必须写出可被证伪的表述",
+    });
   }
   if (draft.horizonMinMonths > draft.horizonMaxMonths) {
     context.addIssue({ code: "custom", path: ["horizonMaxMonths"], message: "最长投资周期不能短于最短周期" });
@@ -157,6 +183,8 @@ export function compileThesisDraft(input: {
   horizonMinMonths: number;
   horizonMaxMonths: number;
   confidence: number;
+  entryBasis?: { type: EntryBasisCode; falsifier: string };
+  exitPlan?: string;
 }): ThesisDraftPayload {
   const fuzzyExpressions = fuzzyWords.filter((word) => input.inputText.includes(word));
   const isFund = input.assetType !== "EQUITY";
@@ -197,7 +225,13 @@ export function compileThesisDraft(input: {
           action: "MUST_REVIEW",
         }]
       : [],
-    clarificationQuestions: fuzzyExpressions.map((word) => `你提到“${word}”，请给出可监控的数值阈值和连续周期。`).slice(0, 3),
+    clarificationQuestions: [
+      ...(input.entryBasis && isWeakEntryBasis(input.entryBasis.type) && input.entryBasis.falsifier.trim().length < 8
+        ? [`你选择的买入依据是弱依据，请补一句“若某件事到某个时点仍未发生，说明我判断错了”。`]
+        : []),
+      ...(input.exitPlan && input.exitPlan.trim().length < 8 ? ["退出条件还没写清楚。这是你自己的计划，不是系统的建议。"] : []),
+      ...fuzzyExpressions.map((word) => `你提到“${word}”，请给出可监控的数值阈值和连续周期。`),
+    ].slice(0, 3),
     fuzzyExpressions,
   };
 }

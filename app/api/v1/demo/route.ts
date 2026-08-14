@@ -10,12 +10,13 @@ import {
   importEvidence,
   readDemoState,
   recordReviewEvent,
+  recordUnplannedAction,
   resetScenario,
   saveEvidenceFeedback,
   setScenario,
   updateDraft,
 } from "../../../lib/demo-store";
-import { thesisDraftSchema } from "../../../lib/product-domain";
+import { entryBasisSchema, thesisDraftSchema } from "../../../lib/product-domain";
 
 const actionSchema = z.discriminatedUnion("action", [
   z.object({ action: z.literal("advance"), expectedCurrentPoint: z.number().int().min(0).max(6) }),
@@ -32,6 +33,8 @@ const actionSchema = z.discriminatedUnion("action", [
     horizonMinMonths: z.number().int().min(1).max(120),
     horizonMaxMonths: z.number().int().min(1).max(240),
     confidence: z.number().int().min(0).max(100),
+    entryBasis: entryBasisSchema.optional(),
+    exitPlan: z.string().trim().max(1000).optional(),
   }),
   z.object({
     action: z.literal("import-evidence"),
@@ -63,6 +66,13 @@ const actionSchema = z.discriminatedUnion("action", [
     reason: z.string().trim().min(8).max(1000),
     confidence: z.number().int().min(0).max(100),
     challengerEvidence: z.string().trim().max(1000).optional(),
+  }),
+  z.object({
+    action: z.literal("unplanned-action"),
+    decisionAction: z.enum(["HOLD", "ADD", "REDUCE", "EXIT"]),
+    triggerSource: z.enum(["ASSUMPTION_CHANGE", "PRICE_MOVE", "MARKET_OR_SECTOR", "NEWS_OR_OPINION"]),
+    reason: z.string().trim().min(8).max(1000),
+    confidence: z.number().int().min(0).max(100),
   }),
 ]);
 
@@ -111,6 +121,14 @@ export async function POST(request: NextRequest) {
           challengerEvidence: input.challengerEvidence,
         }),
       });
+      case "unplanned-action": return NextResponse.json({
+        data: await recordUnplannedAction(owner, {
+          action: input.decisionAction,
+          triggerSource: input.triggerSource,
+          reason: input.reason,
+          confidence: input.confidence,
+        }),
+      });
     }
   } catch (error) {
     return errorResponse(error);
@@ -122,7 +140,7 @@ function errorResponse(error: unknown) {
   console.error("demo-api-error", code);
   const conflictCodes = new Set(["SCENARIO_POINT_CONFLICT", "INVALID_STATE_TRANSITION"]);
   const configCodes = new Set(["LLM_NOT_CONFIGURED", "RICEQUANT_NOT_CONFIGURED"]);
-  const validationCodes = new Set(["CHALLENGER_EVIDENCE_REQUIRED", "DRAFT_NOT_FOUND", "SCENARIO_DATA_MISSING", "REASSIGNMENT_DETAILS_REQUIRED", "ASSUMPTION_NOT_FOUND", "INVALID_DEFERRED_UNTIL", "REVIEW_DEFERRED"]);
+  const validationCodes = new Set(["CHALLENGER_EVIDENCE_REQUIRED", "DRAFT_NOT_FOUND", "SCENARIO_DATA_MISSING", "REASSIGNMENT_DETAILS_REQUIRED", "ASSUMPTION_NOT_FOUND", "INVALID_DEFERRED_UNTIL", "REVIEW_DEFERRED", "TRIGGER_SOURCE_REQUIRED"]);
   const schemaInvalid = code.startsWith("THESIS_SCHEMA_INVALID:");
   const status = schemaInvalid || validationCodes.has(code) ? 422 : conflictCodes.has(code) ? 409 : configCodes.has(code) ? 503 : 500;
   const message = schemaInvalid
@@ -141,6 +159,8 @@ function errorResponse(error: unknown) {
                 ? "复盘提醒时间必须晚于当前时间。"
                 : code === "REVIEW_DEFERRED"
                   ? "复盘已延期；请先补充所需证据，再提交最终决定。"
+                  : code === "TRIGGER_SOURCE_REQUIRED"
+                    ? "记录计划外行动时必须选择这次操作的推动因素。"
     : conflictCodes.has(code)
     ? "当前状态已变化，请刷新后重试。"
     : configCodes.has(code)

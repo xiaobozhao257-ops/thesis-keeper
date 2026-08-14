@@ -32,6 +32,7 @@ export const decisionSnapshots = sqliteTable("decision_snapshots", {
   id: text("id").primaryKey(), sessionId: text("session_id").notNull(), action: text("action").notNull(),
   reason: text("reason").notNull(), confidence: integer("confidence").notNull(), thesisVersionId: text("thesis_version_id").notNull(),
   healthScore: integer("health_score").notNull(), frozenPayload: text("frozen_payload").notNull(), contentHash: text("content_hash").notNull(),
+  recordType: text("record_type").notNull().default("PLANNED_REVIEW"), triggerSource: text("trigger_source"),
   createdAt: text("created_at").notNull(),
 }, (table) => [index("idx_snapshots_session_created").on(table.sessionId, table.createdAt)]);
 

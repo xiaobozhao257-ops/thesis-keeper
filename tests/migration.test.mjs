@@ -23,4 +23,19 @@ test("all migrations apply from an empty database with immutable triggers", () =
   db.prepare("INSERT INTO decision_snapshots (id, session_id, action, reason, confidence, thesis_version_id, health_score, frozen_payload, content_hash, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
     .run("s1", "session", "HOLD", "reason", 50, "v1", 80, "{}", "hash", "2026-08-12");
   assert.throws(() => db.prepare("DELETE FROM decision_snapshots WHERE id = 's1'").run(), /IMMUTABLE_SNAPSHOT/);
+
+  // 计划外行动记录：两列以可加迁移方式引入，旧的 10 列 INSERT 必须仍然落到 PLANNED_REVIEW。
+  const snapshotColumns = db.prepare("PRAGMA table_info(decision_snapshots)").all().map((column) => column.name);
+  assert.ok(snapshotColumns.includes("record_type"));
+  assert.ok(snapshotColumns.includes("trigger_source"));
+  const legacyRow = db.prepare("SELECT record_type, trigger_source FROM decision_snapshots WHERE id = 's1'").get();
+  assert.equal(legacyRow.record_type, "PLANNED_REVIEW");
+  assert.equal(legacyRow.trigger_source, null);
+
+  db.prepare("INSERT INTO decision_snapshots (id, session_id, action, reason, confidence, thesis_version_id, health_score, frozen_payload, content_hash, record_type, trigger_source, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+    .run("s2", "session", "ADD", "追高了", 70, "v1", 80, "{}", "hash2", "UNPLANNED_ACTION", "PRICE_MOVE", "2026-08-12");
+  const unplannedRow = db.prepare("SELECT record_type, trigger_source FROM decision_snapshots WHERE id = 's2'").get();
+  assert.equal(unplannedRow.record_type, "UNPLANNED_ACTION");
+  assert.equal(unplannedRow.trigger_source, "PRICE_MOVE");
+  assert.throws(() => db.prepare("UPDATE decision_snapshots SET reason = 'x' WHERE id = 's2'").run(), /IMMUTABLE_SNAPSHOT/);
 });

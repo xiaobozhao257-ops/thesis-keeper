@@ -54,7 +54,19 @@ export class RicequantMarketDataProvider implements MarketDataProvider {
     void this.baseUrl;
     return {
       assetTypes: ["EQUITY", "ETF", "LOF"] as AssetType[],
-      metricKeys: ["price_close", "turnover", "nav"],
+      // 与 services/rqdata_bridge/server.py 的 METRIC_SPECS 保持一致。
+      metricKeys: [
+        "price_close",
+        "turnover",
+        "nav",
+        "premium_discount",
+        "tracking_error",
+        "aum",
+        "revenue_yoy",
+        "net_profit_yoy",
+        "gross_margin",
+        "operating_cash_flow",
+      ],
       supportsPointInTime: true,
     };
   }

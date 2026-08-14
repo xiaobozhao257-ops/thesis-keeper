@@ -15,6 +15,13 @@
       "when": 1786468084080,
       "tag": "0001_brainy_rhodey",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1786510588515,
+      "tag": "0002_grey_bruce_banner",
+      "breakpoints": true
     }
   ]
 }
