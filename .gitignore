@@ -34,11 +34,14 @@ yarn-error.log*
 .env*
 !.env.example
 
+# local python env for RQSDK / RQData
+/.venv-rqdata/
+__pycache__/
+
 # vercel
 .vercel
 
 /dist/
-/build/
 /.wrangler/
 /outputs/
 /work/

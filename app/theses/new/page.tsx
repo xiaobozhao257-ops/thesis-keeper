@@ -1,5 +1,5 @@
-import { ThesisKeeperApp } from "../../components/ThesisKeeperApp";
+import { AlphaNewThesisApp } from "../../components/AlphaApp";
 
 export default function NewThesisPage() {
-  return <ThesisKeeperApp view="new-thesis" />;
+  return <AlphaNewThesisApp />;
 }

@@ -24,9 +24,9 @@ test("server-renders the Thesis Keeper product shell", async () => {
   const html = await response.text();
   assert.match(html, /<title>Thesis Keeper｜AI 投资决策复盘<\/title>/i);
   assert.match(html, /THESIS/);
-  assert.match(html, /华星智算/);
+  assert.match(html, /LOCAL ALPHA/);
   assert.match(html, /投资组合/);
-  assert.match(html, /论点健康度仅表示|不构成证券分析/);
+  assert.match(html, /不构成投资建议|不构成证券分析/);
   assert.doesNotMatch(html, /Your site is taking shape|codex-preview|react-loading-skeleton/i);
 });
 
@@ -38,6 +38,7 @@ test("server-renders all six primary routes", async () => {
     ["/evidence", "证据中心"],
     ["/reviews/demo-review", "论点复盘"],
     ["/decisions", "决策记录"],
+    ["/demo", "Demo 总览"],
   ];
 
   for (const [pathname, copy] of routes) {

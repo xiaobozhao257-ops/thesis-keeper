@@ -4,11 +4,18 @@ import { FormEvent, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import {
   assumptions,
+  BEHAVIOR_MIRROR_MIN_SAMPLE,
   calculateHealth,
+  entryBasisTypes,
   impactLabel,
+  isWeakEntryBasis,
   metricSeries,
   scenarioEvents,
   stateLabel,
+  summarizeBehavior,
+  triggerSourceLabel,
+  triggerSources,
+  type BehaviorMirror,
   type DecisionAction,
   type EvidenceImpact,
 } from "../lib/demo-domain";
@@ -25,6 +32,8 @@ type ThesisPayload = {
   horizonMinMonths: number;
   horizonMaxMonths: number;
   confidence: number;
+  entryBasis?: { type: string; falsifier: string };
+  exitPlan?: string;
   assumptions: Array<{ code: string; title: string; description: string; weight: number }>;
   metrics: Array<{ key: string; name: string; unit: string; period: string; assumptionCode: string }>;
   rules: Array<{ name: string; type: "METRIC_RULE" | "EVIDENCE_RULE"; metricKey?: string; operator?: "LT" | "LTE" | "GT" | "GTE"; threshold?: number; unit?: string; requiredConsecutivePeriods?: number; action: "MUST_REVIEW" | "ATTENTION_ONLY" }>;
@@ -86,7 +95,14 @@ type DemoState = {
     evidence: Array<{ id: string; title: string; impact: string; sourceTitle: string; publishedAt: string; verification: string }>;
     priceSnapshot: { value: number; currency: string; observedAt: string; source: string } | null;
     challengerEvidence: string | null;
+    recordType: "PLANNED_REVIEW" | "UNPLANNED_ACTION";
+    triggerSource: string | null;
+    ruleStatus: string | null;
+    assumptionStatus: { total: number; supporting: number; mixed: number; weakened: number } | null;
   }>;
+  behavior: BehaviorMirror;
+  staleness: { daysSinceLastEvidence: number; penalty: number };
+  triggerSources: Array<{ code: string; label: string; note: string }>;
   thesis: ThesisVersion | null;
   reviewThesis: ThesisVersion | null;
   draft: ThesisVersion | null;
@@ -113,6 +129,9 @@ const initialState: DemoState = {
   rule: { status: "NO_MATCH", current: 0, required: 2, label: "未触发 0/2" },
   evidence: [],
   snapshots: [],
+  behavior: summarizeBehavior({ decisions: [], thesisConfirmedAt: null, horizonMinMonths: null, horizonMaxMonths: null }),
+  staleness: { daysSinceLastEvidence: 0, penalty: 0 },
+  triggerSources: triggerSources.map((item) => ({ ...item })),
   thesis: null,
   reviewThesis: null,
   draft: null,
@@ -123,7 +142,7 @@ const initialState: DemoState = {
 };
 
 const nav = [
-  { view: "portfolio", href: "/portfolio", index: "01", label: "投资组合" },
+  { view: "portfolio", href: "/demo", index: "01", label: "Demo 总览" },
   { view: "new-thesis", href: "/theses/new", index: "02", label: "新建论点" },
   { view: "thesis", href: "/theses/demo-thesis", index: "03", label: "论点详情" },
   { view: "evidence", href: "/evidence", index: "04", label: "证据中心" },
@@ -197,7 +216,7 @@ export function ThesisKeeperApp({ view }: { view: View }) {
   return (
     <div className="app-frame">
       <aside className="side-rail">
-        <Link className="brand" href="/portfolio" aria-label="Thesis Keeper 首页">
+        <Link className="brand" href="/demo" aria-label="Thesis Keeper Demo 首页">
           <span className="brand-mark">TK</span>
           <span><strong>THESIS</strong><strong>KEEPER</strong></span>
         </Link>
@@ -330,7 +349,12 @@ function PortfolioView({ data, advance, mutate, pending }: { data: DemoState; ad
         <MetricStat label="关键指标" value={data.session.currentPoint >= 5 ? "17%" : data.session.currentPoint >= 4 ? "19%" : data.session.currentPoint >= 1 ? "31%" : "—"} note="收入同比增速" />
         <MetricStat label="失效条件" value={data.rule.label} note="连续两季度 <20%" tone={data.rule.status === "TRIGGERED" ? "danger" : ""} />
         <MetricStat label="相关证据" value={`${data.evidence.length} 条`} note={`${data.evidence.filter((item) => item.impact !== "SUPPORT").length} 条反方信号`} />
-        <MetricStat label="原始置信度" value="80%" note="由用户在 T0 填写" />
+        <MetricStat
+          label="证据时效"
+          value={`${data.staleness.daysSinceLastEvidence} 天`}
+          note={data.staleness.penalty ? `距上次新事实已久，健康度已扣 ${data.staleness.penalty} 分` : "距上次有新事实进入这个论点"}
+          tone={data.staleness.penalty ? "danger" : ""}
+        />
       </section>
 
       <section className="section-block">
@@ -359,12 +383,20 @@ function PortfolioView({ data, advance, mutate, pending }: { data: DemoState; ad
           ))}
         </div>
       </section>
+
+      <section className="section-block">
+        <SectionHeading index="03" title="计划外行动" subtitle="不用等规则触发也能记录。系统不阻止任何操作，只把你声明的理由和真正推动这次操作的因素并排存下来。" />
+        <UnplannedActionPanel data={data} mutate={mutate} pending={pending} />
+      </section>
     </div>
   );
 }
 
 function NewThesisView({ data, mutate, pending }: { data: DemoState; mutate: (body: Record<string, unknown>, label: string) => Promise<boolean>; pending: string | null }) {
   const [reason, setReason] = useState(data.draft?.inputText || "我认为国内算力基础设施投入会持续增长，公司在核心客户中有较强的产品优势。只要收入增速和盈利质量没有明显恶化，我愿意持有 12 到 24 个月。");
+  const [entryBasisType, setEntryBasisType] = useState<string>("FUNDAMENTAL_CHANGE");
+  const [falsifier, setFalsifier] = useState("");
+  const [exitPlan, setExitPlan] = useState("");
   const [instrumentName, setInstrumentName] = useState("华星智算");
   const [canonicalCode, setCanonicalCode] = useState("688888.XSHG");
   const [assetType, setAssetType] = useState<"EQUITY" | "ETF" | "LOF">("EQUITY");
@@ -397,8 +429,16 @@ function NewThesisView({ data, mutate, pending }: { data: DemoState; mutate: (bo
   }
 
   async function compile() {
-    await mutate({ action: "compile-draft", instrumentName, canonicalCode, assetType, inputText: reason, horizonMinMonths: 12, horizonMaxMonths: 24, confidence }, "compile");
+    await mutate({
+      action: "compile-draft", instrumentName, canonicalCode, assetType, inputText: reason,
+      horizonMinMonths: 12, horizonMaxMonths: 24, confidence,
+      entryBasis: { type: entryBasisType, falsifier },
+      exitPlan: exitPlan.trim() || undefined,
+    }, "compile");
   }
+
+  const weakBasis = isWeakEntryBasis(entryBasisType);
+  const basisBlocked = weakBasis && falsifier.trim().length < 8;
 
   const payload = data.draft?.payload;
 
@@ -426,7 +466,25 @@ function NewThesisView({ data, mutate, pending }: { data: DemoState; mutate: (bo
         </div>
         <label htmlFor="thesis-reason">为什么你想投资这家公司？</label>
         <textarea id="thesis-reason" value={reason} onChange={(event) => setReason(event.target.value)} />
-        <div className="editor-toolbar"><span>{reason.length} 字 · 预计周期 12–24 个月</span><button className="secondary-button" onClick={compile} disabled={pending !== null}>{pending === "compile" ? "结构化中…" : "生成结构化草稿"}</button></div>
+        <div className="entry-discipline">
+          <span className="section-number">ENTRY DISCIPLINE</span>
+          <label htmlFor="entry-basis">这次买入，最主要的依据是什么？</label>
+          <select id="entry-basis" value={entryBasisType} onChange={(event) => setEntryBasisType(event.target.value)}>
+            {entryBasisTypes.map((item) => <option value={item.code} key={item.code}>{item.label}{item.weak ? "（弱依据）" : ""}</option>)}
+          </select>
+          <small>{entryBasisTypes.find((item) => item.code === entryBasisType)?.note}</small>
+          {weakBasis ? (
+            <div className="challenger">
+              <span>WEAK BASIS</span>
+              <strong>价格动量、消息和他人推荐都无法被检验，所以必须先写下判错的条件。</strong>
+              <p>补一句“若某件事到某个时点仍未发生，说明我判断错了”。这句话会和论点一起冻结，之后不能改。</p>
+              <textarea aria-label="可被证伪的表述" value={falsifier} onChange={(event) => setFalsifier(event.target.value)} placeholder="例：若到 2026 年底该客户订单仍未落地，说明我判断错了" />
+            </div>
+          ) : null}
+          <label htmlFor="exit-plan">你打算在什么情况下卖出？</label>
+          <textarea id="exit-plan" value={exitPlan} onChange={(event) => setExitPlan(event.target.value)} placeholder="这是你自己写下的计划，不是系统给出的建议。可以留空。" />
+        </div>
+        <div className="editor-toolbar"><span>{reason.length} 字 · 预计周期 12–24 个月</span><button className="secondary-button" onClick={compile} disabled={pending !== null || basisBlocked}>{pending === "compile" ? "结构化中…" : basisBlocked ? "请先写下判错的条件" : "生成结构化草稿"}</button></div>
       </section>
 
       {payload ? (
@@ -467,6 +525,13 @@ function DraftEditor({ payload, versions, mutate, pending }: { payload: ThesisPa
       <section className="draft-editor-panel">
         <div className="draft-editor-head"><div><span className="section-number">EDITABLE DRAFT</span><h2>校正结构化结果</h2><p>确认前可以修改核心论点、假设、监控指标和失效规则。</p></div><span className={Math.abs(weightTotal - 1) < 0.0001 ? "valid-weight" : "invalid-weight"}>假设权重 {(weightTotal * 100).toFixed(0)}%</span></div>
         <label>核心论点<textarea value={draft.coreThesis} onChange={(event) => setDraft({ ...draft, coreThesis: event.target.value })} /></label>
+        {draft.entryBasis || draft.exitPlan ? (
+          <div className="draft-list"><strong>建仓纪律</strong><article>
+            {draft.entryBasis ? <label>买入依据<input value={`${entryBasisTypes.find((item) => item.code === draft.entryBasis?.type)?.label ?? draft.entryBasis.type}${isWeakEntryBasis(draft.entryBasis.type) ? "（弱依据）" : ""}`} readOnly title="买入依据在冻结前决定，之后不可改写" /></label> : null}
+            {draft.entryBasis?.falsifier ? <label>判错条件<input value={draft.entryBasis.falsifier} onChange={(event) => setDraft({ ...draft, entryBasis: { type: draft.entryBasis!.type, falsifier: event.target.value } })} /></label> : null}
+            {draft.exitPlan ? <label>退出计划<input value={draft.exitPlan} onChange={(event) => setDraft({ ...draft, exitPlan: event.target.value })} /></label> : null}
+          </article></div>
+        ) : null}
         <div className="draft-list"><strong>关键假设</strong>{draft.assumptions.map((item, index) => <article key={item.code}><span>{item.code}</span><label>标题<input value={item.title} onChange={(event) => patchAssumption(index, { title: event.target.value })} /></label><label>说明<input value={item.description} onChange={(event) => patchAssumption(index, { description: event.target.value })} /></label><label>权重<input type="number" min="0" max="1" step="0.05" value={item.weight} onChange={(event) => patchAssumption(index, { weight: Number(event.target.value) })} /></label></article>)}</div>
         <div className="draft-list"><strong>监控指标</strong>{draft.metrics.map((item, index) => <article key={item.key}><span>{item.key}</span><label>名称<input value={item.name} onChange={(event) => patchMetric(index, { name: event.target.value })} /></label><label>关联假设<select value={item.assumptionCode} onChange={(event) => patchMetric(index, { assumptionCode: event.target.value })}>{draft.assumptions.map((assumption) => <option key={assumption.code}>{assumption.code}</option>)}</select></label><label>周期<input value={item.period} readOnly title="指标周期由 Catalog 固定" /></label></article>)}</div>
         <div className="draft-list"><strong>失效规则</strong>{draft.rules.map((item, index) => <article key={`${item.type}-${index}`}><span>{item.type}</span><label>规则名称<input value={item.name} onChange={(event) => patchRule(index, { name: event.target.value })} /></label><label>阈值<input type="number" value={item.threshold ?? ""} onChange={(event) => patchRule(index, { threshold: Number(event.target.value) })} /></label><label>连续周期<input type="number" min="1" max="12" value={item.requiredConsecutivePeriods ?? 1} onChange={(event) => patchRule(index, { requiredConsecutivePeriods: Number(event.target.value) })} /></label></article>)}</div>
@@ -643,16 +708,113 @@ function DecisionsView({ data }: { data: DemoState }) {
   return (
     <div className="page-stack">
       <section className="decisions-head"><div><span className="section-number">APPEND-ONLY MEMORY</span><h2>每次重大决定，都保留当时的证据环境。</h2><p>历史快照不可编辑；后续只能创建新的决定。</p></div><span>{data.snapshots.length} 个快照</span></section>
+      <section className="section-block">
+        <SectionHeading index="MIRROR" title="行为镜子" subtitle="全部来自你自己冻结的记录。这里只做计数，不做评价——判断这样好不好是你的事。" />
+        <BehaviorMirrorPanel behavior={data.behavior} />
+      </section>
       <section className="snapshot-list">
         {data.snapshots.length ? data.snapshots.map((item, index) => (
           <article className="snapshot-card" key={item.id}>
             <div className="snapshot-date"><strong>{new Date(item.createdAt).toLocaleDateString("zh-CN", { month: "2-digit", day: "2-digit" })}</strong><span>{new Date(item.createdAt).getFullYear()}</span></div>
-            <div className="snapshot-main"><span>DECISION #{String(data.snapshots.length - index).padStart(2, "0")}</span><h3>{actionLabels[item.action as keyof typeof actionLabels] ?? item.action}</h3><p>{item.reason}</p>{item.challengerEvidence ? <p><strong>逆向决定新证据：</strong>{item.challengerEvidence}</p> : null}<div><b>置信度 {item.confidence}%</b><b>健康度 {item.healthScore}</b><b>Thesis V{item.thesisVersionNo}</b><b>{item.evidenceCount} 条证据 / {item.counterEvidenceCount} 条反方</b>{item.priceSnapshot ? <b>价格快照 ¥{item.priceSnapshot.value.toFixed(2)}</b> : <b>旧快照未记录价格</b>}</div><details><summary>查看冻结证据</summary>{item.evidence.length ? <ul>{item.evidence.map((evidence) => <li key={evidence.id}><strong>{evidence.title}</strong> · {impactLabel(evidence.impact as EvidenceImpact)} · {evidence.sourceTitle} · {evidence.publishedAt.slice(0, 10)}</li>)}</ul> : <small>旧快照未保存证据明细。</small>}</details><details><summary>查看冻结环境与完整性信息</summary><small>版本 ID：{item.thesisVersionId}<br />内容哈希：{item.contentHash}<br />记录 ID：{item.id}<br />创建时间：{item.createdAt}{item.priceSnapshot ? <><br />价格时间：{item.priceSnapshot.observedAt}<br />价格来源：{item.priceSnapshot.source}</> : null}</small></details></div>
+            <div className="snapshot-main"><span>{item.recordType === "UNPLANNED_ACTION" ? "UNPLANNED" : "DECISION"} #{String(data.snapshots.length - index).padStart(2, "0")}</span><h3>{actionLabels[item.action as keyof typeof actionLabels] ?? item.action}</h3>{item.triggerSource ? <p className={`trigger-tag ${item.triggerSource === "ASSUMPTION_CHANGE" ? "" : "off-thesis"}`}>推动因素：{triggerSourceLabel(item.triggerSource)}{item.triggerSource === "ASSUMPTION_CHANGE" ? "" : "（非论点驱动）"}{item.assumptionStatus ? ` · 当时 ${item.assumptionStatus.supporting}/${item.assumptionStatus.total} 条假设仍成立` : ""}</p> : null}<p>{item.reason}</p>{item.challengerEvidence ? <p><strong>逆向决定新证据：</strong>{item.challengerEvidence}</p> : null}<div><b>置信度 {item.confidence}%</b><b>健康度 {item.healthScore}</b><b>Thesis V{item.thesisVersionNo}</b><b>{item.evidenceCount} 条证据 / {item.counterEvidenceCount} 条反方</b>{item.priceSnapshot ? <b>价格快照 ¥{item.priceSnapshot.value.toFixed(2)}</b> : <b>旧快照未记录价格</b>}</div><details><summary>查看冻结证据</summary>{item.evidence.length ? <ul>{item.evidence.map((evidence) => <li key={evidence.id}><strong>{evidence.title}</strong> · {impactLabel(evidence.impact as EvidenceImpact)} · {evidence.sourceTitle} · {evidence.publishedAt.slice(0, 10)}</li>)}</ul> : <small>旧快照未保存证据明细。</small>}</details><details><summary>查看冻结环境与完整性信息</summary><small>版本 ID：{item.thesisVersionId}<br />内容哈希：{item.contentHash}<br />记录 ID：{item.id}<br />创建时间：{item.createdAt}{item.priceSnapshot ? <><br />价格时间：{item.priceSnapshot.observedAt}<br />价格来源：{item.priceSnapshot.source}</> : null}</small></details></div>
             <div className={`snapshot-lock ${item.integrityValid ? "" : "invalid"}`}><span>{item.integrityValid ? "LOCKED" : "INTEGRITY ALERT"}</span><strong>{item.integrityValid ? "SHA-256 验签有效" : "快照内容与哈希不一致"}</strong><small>{item.contentHash.slice(0, 12)}…</small></div>
           </article>
         )) : <EmptyState title="还没有决策快照" body="推进到 T5 完成一次复盘后，快照会永久出现在这里。" actionHref="/reviews/demo-review" actionLabel="前往论点复盘" />}
       </section>
       <section className="workflow-log"><SectionHeading index="OPS" title="工作流日志" subtitle="不记录原始敏感文本，只记录模块、Provider、状态、时延、用量与摘要。" />{data.workflows.length ? data.workflows.map((item) => <article key={item.id}><span>{item.module}</span><strong>{item.status}</strong><b>{item.provider}</b><p>{item.outputSummary || item.errorCode || "完成"}<br />{item.latencyMs}ms · {item.inputTokens} in / {item.outputTokens} out{item.estimatedCostCny === null ? "" : ` · ¥${item.estimatedCostCny.toFixed(4)}`}</p><small>{new Date(item.createdAt).toLocaleString("zh-CN")}</small></article>) : <EmptyState title="暂无工作流记录" body="结构化论点、导入证据或推进场景后会生成日志。" />}</section>
+    </div>
+  );
+}
+
+/**
+ * 计划外行动记录。刻意不设任何拦截：用户选完推动因素就能提交。
+ * 唯一的产品动作是把「你声明的理由」和「你当初写下的条件现在成立几条」摆在一起。
+ */
+function UnplannedActionPanel({ data, mutate, pending }: { data: DemoState; mutate: (body: Record<string, unknown>, label: string) => Promise<boolean>; pending: string | null }) {
+  const [open, setOpen] = useState(false);
+  const [action, setAction] = useState<Exclude<DecisionAction, "DEFER">>("ADD");
+  const [triggerSource, setTriggerSource] = useState<string>("");
+  const [reason, setReason] = useState("");
+  const [confidence, setConfidence] = useState(60);
+  const states = assumptions.map((item) => item.stateAt[Math.min(data.session.currentPoint, 5)]);
+  const supporting = states.filter((state) => state === "支持").length;
+  const thesisDriven = triggerSource === "ASSUMPTION_CHANGE";
+
+  async function submit(event: FormEvent) {
+    event.preventDefault();
+    const ok = await mutate({ action: "unplanned-action", decisionAction: action, triggerSource, reason, confidence }, "unplanned");
+    if (ok) { setOpen(false); setReason(""); setTriggerSource(""); }
+  }
+
+  if (!open) {
+    return (
+      <div className="unplanned-teaser">
+        <div><strong>今天动手了吗？</strong><p>加仓、减仓或清仓，只要发生就记一笔。不记录的操作，半年后你不会记得当时在想什么。</p></div>
+        <button className="secondary-button" type="button" onClick={() => setOpen(true)}>记录一次计划外行动</button>
+      </div>
+    );
+  }
+
+  return (
+    <form className="unplanned-panel" onSubmit={submit}>
+      <div className="action-picker">{(Object.keys(actionLabels) as Array<Exclude<DecisionAction, "DEFER">>).map((item) => <button type="button" className={action === item ? "active" : ""} onClick={() => setAction(item)} key={item}>{actionLabels[item]}</button>)}</div>
+      <fieldset className="trigger-picker">
+        <legend>是什么推动了这次操作？</legend>
+        {data.triggerSources.map((item) => (
+          <label className={triggerSource === item.code ? "active" : ""} key={item.code}>
+            <input type="radio" name="trigger-source" value={item.code} checked={triggerSource === item.code} onChange={() => setTriggerSource(item.code)} />
+            <span><strong>{item.label}</strong>{item.note}</span>
+          </label>
+        ))}
+      </fieldset>
+      {triggerSource ? (
+        <div className={`mirror-note ${thesisDriven ? "" : "off-thesis"}`}>
+          <span>你当初写下的条件</span>
+          <strong>{supporting} / {states.length} 条假设仍然成立</strong>
+          <p>{thesisDriven
+            ? "你声明这次操作来自假设变化。记完之后可以顺手把对应证据补进证据中心，让这条判断有据可查。"
+            : `你声明的推动因素是「${triggerSourceLabel(triggerSource)}」，它不属于你当初写下的任何一条假设。系统不阻止这次操作，只是把这两件事一起记下来。`}</p>
+        </div>
+      ) : null}
+      <label htmlFor="unplanned-reason">你的理由</label>
+      <textarea id="unplanned-reason" value={reason} onChange={(event) => setReason(event.target.value)} placeholder="至少写 8 个字。写给半年后的自己看。" />
+      <label htmlFor="unplanned-confidence">此刻置信度 <strong>{confidence}%</strong></label>
+      <input id="unplanned-confidence" type="range" min="0" max="100" value={confidence} onChange={(event) => setConfidence(Number(event.target.value))} />
+      <div className="decision-actions">
+        <button className="primary-button" type="submit" disabled={pending !== null || !triggerSource || reason.trim().length < 8}>{pending === "unplanned" ? "正在冻结…" : "冻结这次记录"}</button>
+        <button className="text-button" type="button" onClick={() => setOpen(false)}>取消</button>
+      </div>
+      <small>这条记录同样不可编辑、不可删除，并计入行为镜子。</small>
+    </form>
+  );
+}
+
+/** 行为镜子。只呈现计数和中位数；样本不足时明确说不足，不给任何倾向性描述。 */
+function BehaviorMirrorPanel({ behavior }: { behavior: BehaviorMirror }) {
+  if (!behavior.decisionCount) {
+    return <EmptyState title="行为镜子还没有数据" body={`记录第一笔决定后开始累积；满 ${BEHAVIOR_MIRROR_MIN_SAMPLE} 笔才会呈现分布。`} />;
+  }
+  if (!behavior.sampleSufficient) {
+    return (
+      <div className="mirror-insufficient">
+        <strong>已记录 {behavior.decisionCount} 笔决定</strong>
+        <p>样本少于 {BEHAVIOR_MIRROR_MIN_SAMPLE} 笔时，任何比例都不能说明习惯。这里暂不给出分布，只等你继续记录。</p>
+      </div>
+    );
+  }
+  const horizon = behavior.declaredHorizonMonths;
+  return (
+    <div className="mirror-grid">
+      <article><span>论点驱动的决定</span><strong>{behavior.thesisDrivenCount} / {behavior.decisionCount}</strong><small>占 {behavior.thesisDrivenShare}%。其余由价格、大盘或消息推动。</small></article>
+      <article><span>计划外行动</span><strong>{behavior.unplannedCount} 笔</strong><small>占 {behavior.unplannedShare}%，即未经规则触发就动手的次数。</small></article>
+      <article><span>决定间隔中位数</span><strong>{behavior.medianDaysBetweenDecisions === null ? "—" : `${behavior.medianDaysBetweenDecisions} 天`}</strong><small>两次记录之间的典型间隔。</small></article>
+      <article><span>声明周期 vs 实际持有</span><strong>{horizon ? `${horizon.min}–${horizon.max} 个月` : "未声明"}</strong><small>{behavior.holdingDays === null ? "缺少冻结时间，无法计算。" : `${behavior.exited ? "已退出" : "至今"}持有 ${behavior.holdingDays} 天${behavior.exitedBeforeHorizon === null ? "" : behavior.exitedBeforeHorizon ? "，短于你声明的最短周期" : "，未短于你声明的最短周期"}。`}</small></article>
+      <article><span>规则触发后仍选择持有</span><strong>{behavior.holdAfterTriggerCount} / {behavior.afterTriggerCount}</strong><small>其中 {behavior.holdAfterTriggerWithCounterEvidence} 次当时已有反方证据在案。</small></article>
+      <article><span>平均置信度</span><strong>{behavior.averageConfidence ?? "—"}%</strong><small>计划外 {behavior.averageConfidenceUnplanned ?? "—"}% · 计划内 {behavior.averageConfidencePlanned ?? "—"}%</small></article>
+      <article className="mirror-breakdown">
+        <span>计划外行动的推动因素</span>
+        <ul>{behavior.triggerBreakdown.map((item) => <li key={item.code}><b>{item.label}</b><i>{item.count} 次</i><em>{item.thesisDriven ? "论点驱动" : "非论点驱动"}</em></li>)}</ul>
+      </article>
     </div>
   );
 }

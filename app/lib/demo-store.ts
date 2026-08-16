@@ -1,6 +1,18 @@
 import { env as workerEnv } from "cloudflare:workers";
-import { calculateHealth, getRuleState, getScenarioRuleState, isScenarioDataAvailable, seededEvidence } from "./demo-domain";
-import { canonicalJson, compileThesisDraft, parseEvidenceInput, validateThesisDraft, type ThesisDraftPayload } from "./product-domain";
+import {
+  assumptionStatusAt,
+  calculateHealth,
+  getRuleState,
+  getScenarioRuleState,
+  isScenarioDataAvailable,
+  seededEvidence,
+  summarizeBehavior,
+  triggerSources,
+  type BehaviorDecision,
+  type DecisionRecordType,
+  type TriggerSourceCode,
+} from "./demo-domain";
+import { canonicalJson, compileThesisDraft, parseEvidenceInput, validateThesisDraft, type EntryBasisCode, type ThesisDraftPayload } from "./product-domain";
 import { FixtureLLMProvider } from "../providers/llm/FixtureLLMProvider";
 import { RemoteStructuredLLMProvider } from "../providers/llm/RemoteStructuredLLMProvider";
 import { MockMarketDataProvider } from "../providers/market/MockMarketDataProvider";
@@ -83,6 +95,8 @@ const schemaStatements = [
     health_score INTEGER NOT NULL,
     frozen_payload TEXT NOT NULL,
     content_hash TEXT NOT NULL,
+    record_type TEXT NOT NULL DEFAULT 'PLANNED_REVIEW',
+    trigger_source TEXT,
     created_at TEXT NOT NULL
   )`,
   `CREATE TABLE IF NOT EXISTS product_theses (
@@ -92,6 +106,10 @@ const schemaStatements = [
     canonical_code TEXT NOT NULL,
     asset_type TEXT NOT NULL,
     current_version_id TEXT,
+    data_mode TEXT NOT NULL DEFAULT 'REAL',
+    status TEXT NOT NULL DEFAULT 'ACTIVE',
+    predecessor_thesis_id TEXT,
+    closed_at TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
   )`,
@@ -283,9 +301,11 @@ export async function initializeDemoStore(ownerId = DEFAULT_OWNER) {
       VALUES (?, ?, 1, 'ACTIVE', ?, 80, ?, ?)`)
       .bind(versionId, sessionId, payload.coreThesis, payloadHash, "2026-02-12T00:00:00Z"),
     db.prepare(`INSERT OR IGNORE INTO product_theses
-      (id, owner_id, instrument_name, canonical_code, asset_type, current_version_id, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
+      (id, owner_id, instrument_name, canonical_code, asset_type, current_version_id, data_mode, status, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, 'DEMO', 'ACTIVE', ?, ?)`)
       .bind(thesisId, owner, payload.instrumentName, payload.canonicalCode, payload.assetType, versionId, now, now),
+    db.prepare("UPDATE product_theses SET data_mode = 'DEMO' WHERE id = ? AND owner_id = ?")
+      .bind(thesisId, owner),
     db.prepare(`INSERT OR IGNORE INTO product_thesis_versions
       (id, thesis_id, owner_id, version_no, status, input_text, core_thesis,
        horizon_min_months, horizon_max_months, confidence, change_type, structured_payload,
@@ -311,9 +331,13 @@ async function ensureProvenanceColumns(db: D1Database) {
   const evidenceColumns = await db.prepare("PRAGMA table_info(evidence)").all<{ name: string }>();
   const importedColumns = await db.prepare("PRAGMA table_info(imported_evidence)").all<{ name: string }>();
   const workflowColumns = await db.prepare("PRAGMA table_info(workflow_runs)").all<{ name: string }>();
+  const snapshotColumns = await db.prepare("PRAGMA table_info(decision_snapshots)").all<{ name: string }>();
+  const productThesisColumns = await db.prepare("PRAGMA table_info(product_theses)").all<{ name: string }>();
   const existingEvidence = new Set(evidenceColumns.results.map((row) => row.name));
   const existingImported = new Set(importedColumns.results.map((row) => row.name));
   const existingWorkflow = new Set(workflowColumns.results.map((row) => row.name));
+  const existingSnapshot = new Set(snapshotColumns.results.map((row) => row.name));
+  const existingProductThesis = new Set(productThesisColumns.results.map((row) => row.name));
   const additions = [
     ...[
       ["source_publisher", "TEXT NOT NULL DEFAULT ''"],
@@ -331,8 +355,19 @@ async function ensureProvenanceColumns(db: D1Database) {
       ["output_tokens", "INTEGER NOT NULL DEFAULT 0"],
       ["estimated_cost_cny", "REAL"],
     ].filter(([name]) => !existingWorkflow.has(name)).map(([name, definition]) => db.prepare(`ALTER TABLE workflow_runs ADD COLUMN ${name} ${definition}`)),
+    ...[
+      ["record_type", "TEXT NOT NULL DEFAULT 'PLANNED_REVIEW'"],
+      ["trigger_source", "TEXT"],
+    ].filter(([name]) => !existingSnapshot.has(name)).map(([name, definition]) => db.prepare(`ALTER TABLE decision_snapshots ADD COLUMN ${name} ${definition}`)),
+    ...[
+      ["data_mode", "TEXT NOT NULL DEFAULT 'REAL'"],
+      ["status", "TEXT NOT NULL DEFAULT 'ACTIVE'"],
+      ["predecessor_thesis_id", "TEXT"],
+      ["closed_at", "TEXT"],
+    ].filter(([name]) => !existingProductThesis.has(name)).map(([name, definition]) => db.prepare(`ALTER TABLE product_theses ADD COLUMN ${name} ${definition}`)),
   ];
   if (additions.length) await db.batch(additions);
+  await db.prepare("CREATE INDEX IF NOT EXISTS idx_product_theses_owner_mode_status ON product_theses(owner_id, data_mode, status)").run();
 }
 
 async function persistVersionChildren(db: D1Database, versionId: string, payload: ThesisDraftPayload) {
@@ -386,7 +421,18 @@ export async function readDemoState(ownerId = DEFAULT_OWNER) {
   const disputed = reviewRows.results.some((row) => row.event_type === "TRIGGER_DISPUTED");
   const fixtureCounterEvidenceId = `${sessionId}:ev-t3-substitution`;
   const counterEvidenceRejected = String(feedback.get(fixtureCounterEvidenceId)?.feedback ?? "") === "REJECTED";
-  const calculatedHealth = calculateHealth(isEmptyFundScenario ? 0 : currentPoint);
+  // 证据时效以「最后一次有新事实进入这个论点」为锚点：已释放的固定证据、用户导入的
+  // 证据，或论点冻结时间，取其中最近的一个。空基金模板没有论点，不计时效扣分。
+  const evidenceTimestamps = [
+    ...fixtureEvidence.results.map((row) => String(row.published_at)),
+    ...importedEvidence.results.map((row) => String(row.created_at)),
+    ...(activeVersion?.confirmed_at ? [String(activeVersion.confirmed_at)] : []),
+  ].map((value) => Date.parse(value)).filter((value) => Number.isFinite(value));
+  const lastEvidenceAt = evidenceTimestamps.length ? Math.max(...evidenceTimestamps) : null;
+  const daysSinceLastEvidence = isEmptyFundScenario || lastEvidenceAt === null
+    ? 0
+    : Math.max(0, Math.floor((Date.now() - lastEvidenceAt) / 86_400_000));
+  const calculatedHealth = calculateHealth(isEmptyFundScenario ? 0 : currentPoint, daysSinceLastEvidence);
   const baseHealth = counterEvidenceRejected && currentPoint >= 3
     ? {
         ...calculatedHealth,
@@ -436,7 +482,12 @@ export async function readDemoState(ownerId = DEFAULT_OWNER) {
       evidence?: Array<{ id?: string; title?: string; impact?: string; sourceTitle?: string; publishedAt?: string; verification?: string }>;
       priceSnapshot?: { value: number; currency: string; observedAt: string; source: string };
       challengerEvidence?: string;
+      rule?: { status?: string };
+      recordType?: string;
+      triggerSource?: string | null;
+      assumptionStatus?: { total: number; supporting: number; mixed: number; weakened: number };
     } | null;
+    const counterEvidenceCount = frozen?.evidence?.filter((item) => item.impact === "WEAKEN" || item.impact === "CONTRADICT").length ?? 0;
     return {
       id: String(row.id), action: String(row.action), reason: String(row.reason),
       confidence: Number(row.confidence), healthScore: Number(row.health_score),
@@ -444,8 +495,12 @@ export async function readDemoState(ownerId = DEFAULT_OWNER) {
       integrityValid: Boolean(frozenPayload) && await sha256(frozenPayload) === String(row.content_hash),
       thesisVersionId: String(row.thesis_version_id),
       thesisVersionNo: Number(frozen?.thesis?.versionNo ?? 1),
+      recordType: (String(row.record_type ?? "PLANNED_REVIEW") === "UNPLANNED_ACTION" ? "UNPLANNED_ACTION" : "PLANNED_REVIEW") as DecisionRecordType,
+      triggerSource: row.trigger_source ? String(row.trigger_source) : null,
+      ruleStatus: frozen?.rule?.status ? String(frozen.rule.status) : null,
+      assumptionStatus: frozen?.assumptionStatus ?? null,
       evidenceCount: frozen?.evidence?.length ?? 0,
-      counterEvidenceCount: frozen?.evidence?.filter((item) => item.impact === "WEAKEN" || item.impact === "CONTRADICT").length ?? 0,
+      counterEvidenceCount,
       evidence: frozen?.evidence?.map((item) => ({
         id: String(item.id ?? ""), title: String(item.title ?? ""), impact: String(item.impact ?? "NEUTRAL"),
         sourceTitle: String(item.sourceTitle ?? ""), publishedAt: String(item.publishedAt ?? ""), verification: String(item.verification ?? "UNVERIFIED"),
@@ -454,6 +509,23 @@ export async function readDemoState(ownerId = DEFAULT_OWNER) {
       challengerEvidence: frozen?.challengerEvidence ?? null,
     };
   }));
+
+  const behavior = summarizeBehavior({
+    decisions: snapshots.map<BehaviorDecision>((item) => ({
+      id: item.id,
+      action: item.action,
+      recordType: item.recordType,
+      triggerSource: item.triggerSource,
+      confidence: item.confidence,
+      healthScore: item.healthScore,
+      ruleStatus: item.ruleStatus,
+      counterEvidenceCount: item.counterEvidenceCount,
+      createdAt: item.createdAt,
+    })),
+    thesisConfirmedAt: activeVersion?.confirmed_at ? String(activeVersion.confirmed_at) : null,
+    horizonMinMonths: activeVersion ? Number(activeVersion.horizon_min_months) : null,
+    horizonMaxMonths: activeVersion ? Number(activeVersion.horizon_max_months) : null,
+  });
 
   const reviewOpened = reviewRows.results.find((row) => row.event_type === "REVIEW_OPENED");
   const reviewOpenedPayload = reviewOpened ? safeJson(reviewOpened.payload) as { thesisVersionId?: string } | null : null;
@@ -478,6 +550,9 @@ export async function readDemoState(ownerId = DEFAULT_OWNER) {
       ...fixtureEvidence.results.map((row) => mapEvidence(row, false)),
     ],
     snapshots,
+    behavior,
+    staleness: { daysSinceLastEvidence, penalty: health.breakdown.stalenessPenalty },
+    triggerSources: triggerSources.map((item) => ({ ...item })),
     thesis: activeVersion ? mapVersion(activeVersion) : null,
     reviewThesis: reviewVersionRow ? mapVersion(reviewVersionRow) : activeVersion ? mapVersion(activeVersion) : null,
     draft: draftVersion ? mapVersion(draftVersion) : null,
@@ -528,6 +603,7 @@ async function logWorkflow(owner: string, module: string, status: string, provid
 export async function compileAndSaveDraft(ownerId: string, input: {
   instrumentName: string; canonicalCode: string; assetType: "EQUITY" | "ETF" | "LOF";
   inputText: string; horizonMinMonths: number; horizonMaxMonths: number; confidence: number;
+  entryBasis?: { type: EntryBasisCode; falsifier: string }; exitPlan?: string;
 }) {
   const owner = normalizeOwner(ownerId);
   await initializeDemoStore(owner);
@@ -830,9 +906,54 @@ export async function createDecisionSnapshot(ownerId: string, input: {
   if (input.action === "ADD" && current.rule.status === "TRIGGERED" && !input.challengerEvidence?.trim()) {
     throw new Error("CHALLENGER_EVIDENCE_REQUIRED");
   }
+  return writeDecisionRecord(owner, current, {
+    recordType: "PLANNED_REVIEW",
+    triggerSource: null,
+    action: input.action,
+    reason: input.reason,
+    confidence: input.confidence,
+    challengerEvidence: input.challengerEvidence,
+    completeReview: true,
+  });
+}
+
+/**
+ * 计划外行动记录。不依赖规则触发，任何时点都能写；必须声明是什么在推动这次操作。
+ * 系统不评价、不阻止，只把用户声明的理由、实际触发源和当时的假设状态一起冻结下来。
+ */
+export async function recordUnplannedAction(ownerId: string, input: {
+  action: "HOLD" | "ADD" | "REDUCE" | "EXIT";
+  triggerSource: TriggerSourceCode;
+  reason: string;
+  confidence: number;
+}) {
+  const owner = normalizeOwner(ownerId);
+  await initializeDemoStore(owner);
+  const current = await readDemoState(owner);
+  if (!isScenarioDataAvailable(current.session.scenarioId)) throw new Error("SCENARIO_DATA_MISSING");
+  if (!triggerSources.some((item) => item.code === input.triggerSource)) throw new Error("TRIGGER_SOURCE_REQUIRED");
+  return writeDecisionRecord(owner, current, {
+    recordType: "UNPLANNED_ACTION",
+    triggerSource: input.triggerSource,
+    action: input.action,
+    reason: input.reason,
+    confidence: input.confidence,
+    completeReview: false,
+  });
+}
+
+async function writeDecisionRecord(owner: string, current: Awaited<ReturnType<typeof readDemoState>>, input: {
+  recordType: DecisionRecordType;
+  triggerSource: TriggerSourceCode | null;
+  action: "HOLD" | "ADD" | "REDUCE" | "EXIT";
+  reason: string;
+  confidence: number;
+  challengerEvidence?: string;
+  completeReview: boolean;
+}) {
   const db = getD1();
   const createdAt = new Date().toISOString();
-  const snapshotThesis = current.reviewThesis ?? current.thesis;
+  const snapshotThesis = input.completeReview ? current.reviewThesis ?? current.thesis : current.thesis;
   const thesisVersionId = snapshotThesis?.id ?? fixtureVersionIdFor(owner);
   const market = new MockMarketDataProvider();
   const priceSeries = await market.getMetricSeries({
@@ -846,24 +967,32 @@ export async function createDecisionSnapshot(ownerId: string, input: {
     observedAt: price.periodEnd,
     source: `${market.providerName}:${price.providerRecordId}`,
   };
+  const assumptionStatus = assumptionStatusAt(current.session.currentPoint);
   const frozenPayload = canonicalJson({ thesisVersionId, thesis: snapshotThesis, action: input.action,
     reason: input.reason, confidence: input.confidence, health: current.health, rule: current.rule,
-    evidence: current.evidence, priceSnapshot, challengerEvidence: input.challengerEvidence?.trim() || null, createdAt });
+    evidence: current.evidence, priceSnapshot, challengerEvidence: input.challengerEvidence?.trim() || null,
+    recordType: input.recordType, triggerSource: input.triggerSource, assumptionStatus, createdAt });
   const contentHash = await sha256(frozenPayload);
   const id = `snapshot:${crypto.randomUUID()}`;
   const sessionId = sessionIdFor(owner);
   await db.batch([
     db.prepare(`INSERT INTO decision_snapshots
-      (id, session_id, action, reason, confidence, thesis_version_id, health_score, frozen_payload, content_hash, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-      .bind(id, sessionId, input.action, input.reason, input.confidence, thesisVersionId, current.health.score, frozenPayload, contentHash, createdAt),
-    db.prepare(`UPDATE demo_sessions SET current_point = 6, review_status = 'COMPLETED', decision_action = ?,
-      decision_reason = ?, decision_confidence = ?, updated_at = ? WHERE id = ? AND owner_id = ?`)
-      .bind(input.action, input.reason, input.confidence, createdAt, sessionId, owner),
+      (id, session_id, action, reason, confidence, thesis_version_id, health_score, frozen_payload, content_hash, record_type, trigger_source, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .bind(id, sessionId, input.action, input.reason, input.confidence, thesisVersionId, current.health.score,
+        frozenPayload, contentHash, input.recordType, input.triggerSource, createdAt),
+    ...(input.completeReview
+      ? [db.prepare(`UPDATE demo_sessions SET current_point = 6, review_status = 'COMPLETED', decision_action = ?,
+          decision_reason = ?, decision_confidence = ?, updated_at = ? WHERE id = ? AND owner_id = ?`)
+        .bind(input.action, input.reason, input.confidence, createdAt, sessionId, owner)]
+      : [db.prepare("UPDATE demo_sessions SET updated_at = ? WHERE id = ? AND owner_id = ?").bind(createdAt, sessionId, owner)]),
     db.prepare(`INSERT INTO review_events (id, owner_id, session_id, event_type, payload, created_at)
-      VALUES (?, ?, ?, 'DECISION_COMPLETED', ?, ?)`)
-      .bind(`review-event:${crypto.randomUUID()}`, owner, sessionId, JSON.stringify({ snapshotId: id, action: input.action }), createdAt),
+      VALUES (?, ?, ?, ?, ?, ?)`)
+      .bind(`review-event:${crypto.randomUUID()}`, owner, sessionId,
+        input.completeReview ? "DECISION_COMPLETED" : "UNPLANNED_ACTION_RECORDED",
+        JSON.stringify({ snapshotId: id, action: input.action, triggerSource: input.triggerSource }), createdAt),
   ]);
-  await logWorkflow(owner, "DECISION_SNAPSHOT", "SUCCEEDED", "user", input, `Snapshot ${id}`);
+  await logWorkflow(owner, input.completeReview ? "DECISION_SNAPSHOT" : "UNPLANNED_ACTION", "SUCCEEDED", "user",
+    { action: input.action, triggerSource: input.triggerSource, recordType: input.recordType }, `Snapshot ${id}`);
   return readDemoState(owner);
 }
